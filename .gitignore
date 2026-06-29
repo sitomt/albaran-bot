@@ -18,3 +18,6 @@ build/
 
 # macOS
 .DS_Store
+
+# Caché de OCR/LLM para el harness de test (no versionar)
+.cache_test/

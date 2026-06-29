@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from .config import settings
 from . import supabase_client as db
+from . import manual_albaran
 from .query_engine import consultar
 from .queue_manager import encolar_job, recuperar_jobs_pendientes, start_workers, _pending_confirmations, _TIMEOUT_CONFIRMACION
 from .conversation_history import agregar_turno, obtener_historial, limpiar_historial
@@ -52,6 +53,7 @@ Gestor de Compras
 
 Mándame fotos de albaranes para registrarlos. También puedo responder cualquier pregunta sobre gastos, precios y proveedores.
 
+/manual — Registrar un albarán a mano (manuscritos, OCR fallido)
 /estado — Cola de procesamiento
 /resumen — Resumen de la semana
 /proveedores — Proveedores registrados
@@ -172,6 +174,62 @@ async def cmd_revisiones(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"Error al obtener revisiones: {e}")
 
 
+# Palabras naturales → columna de BD. Se busca la palabra dentro de la frase del usuario.
+_CAMPOS_CORRECCION = {
+    "precio": "precio_unitario",
+    "importe": "importe_neto",
+    "cantidad": "cantidad",
+    "kilos": "cantidad",
+    "kilo": "cantidad",
+    "peso": "cantidad",
+    "nombre": "descripcion_limpia",
+    "descripción": "descripcion_limpia",
+    "descripcion": "descripcion_limpia",
+}
+# Columna → palabra sencilla (para confirmar al usuario) y clave del valor original en el item.
+_NOMBRE_CAMPO = {
+    "precio_unitario": "precio",
+    "importe_neto": "importe",
+    "cantidad": "cantidad",
+    "descripcion_limpia": "nombre",
+}
+_ORIGEN_CAMPO = {
+    "precio_unitario": "precio",
+    "importe_neto": "importe",
+    "cantidad": "cantidad",
+    "descripcion_limpia": "descripcion",
+}
+
+_AYUDA_CORRECCION = (
+    "No te he entendido. Para corregir un producto, cópiame una de estas frases y cambia solo el dato:\n"
+    "  El precio del 1 es 4,84\n"
+    "  El importe del 1 es 27,76\n"
+    "  La cantidad del 1 es 5,74\n"
+    "  El nombre del 1 es Longaniza Blanca\n"
+    'El "1" es el número del producto. Si está todo bien, contéstame: ok'
+)
+
+
+def _parsear_correccion(texto: str) -> tuple[str, int, str] | None:
+    """'El precio del 1 es 4,84' → ('precio_unitario', 1, '4,84'). None si no encaja."""
+    conector = re.search(r'(?:\bes\b|:|=)', texto, re.IGNORECASE)
+    if not conector:
+        return None
+    izquierda = texto[:conector.start()].lower()
+    valor = texto[conector.end():].strip()
+    if not valor:
+        return None
+    columna = None
+    for palabra, col in _CAMPOS_CORRECCION.items():
+        if palabra in izquierda:
+            columna = col
+            break
+    numeros = re.findall(r'\d+', izquierda)
+    if not columna or not numeros:
+        return None
+    return columna, int(numeros[-1]), valor
+
+
 async def _procesar_confirmacion(update: Update, conf: dict) -> None:
     """Procesa la respuesta del usuario a una solicitud de confirmación."""
     chat_id = update.effective_chat.id
@@ -184,52 +242,80 @@ async def _procesar_confirmacion(update: Update, conf: dict) -> None:
         await update.message.reply_text("Albarán confirmado.")
         return
 
-    # Parsear respuestas "N: valor"
+    # Parsear frases naturales tipo "El precio del 1 es 4,84" (una por renglón)
     correcciones = []
-    for linea_texto in texto.split("\n"):
-        linea_texto = linea_texto.strip()
-        m = re.match(r'^(\d+)\s*[:\-]\s*(.+)$', linea_texto)
-        if m:
-            num = int(m.group(1))
-            valor = m.group(2).strip()
-            for item in conf["lineas"]:
-                if item["num"] == num:
-                    correcciones.append({"item": item, "valor": valor})
+    for renglon in texto.split("\n"):
+        renglon = renglon.strip()
+        if not renglon:
+            continue
+        parsed = _parsear_correccion(renglon)
+        if not parsed:
+            continue
+        columna, num, valor = parsed
+        item = next((it for it in conf["lineas"] if it["num"] == num), None)
+        if item:
+            correcciones.append((item, columna, valor))
 
     if not correcciones:
-        await update.message.reply_text(
-            "No entendí la respuesta. El albarán está guardado. "
-            "Puedes corregirlo con 'Corregir producto [id]: [valor]'."
-        )
+        await update.message.reply_text(_AYUDA_CORRECCION)
         return
 
     resultados = []
-    for c in correcciones:
-        linea_id = c["item"]["linea_id"]
-        valor = c["valor"]
-        descripcion = c["item"]["descripcion"]
+    for item, columna, valor in correcciones:
+        linea_id = item["linea_id"]
+        descripcion = item["descripcion"]
+        nombre_campo = _NOMBRE_CAMPO.get(columna, columna)
         try:
-            # Heurística: si es número → actualizar cantidad; si es texto → actualizar descripción
-            try:
-                nuevo_valor_num = float(valor.replace(",", "."))
-                campo = "cantidad"
-                valor_original = str(c["item"].get("cantidad", ""))
-                kwargs = {"cantidad": nuevo_valor_num, "requiere_revision": False}
-            except ValueError:
-                campo = "descripcion_limpia"
-                valor_original = descripcion
-                kwargs = {"descripcion_limpia": valor, "requiere_revision": False}
-
-            # Registrar corrección en BD
-            await db.registrar_correccion(linea_id, campo, valor_original, valor)
-            # Aplicar corrección
-            await db.actualizar_linea_albaran(linea_id, **kwargs)
-            resultados.append(f"'{descripcion}' {campo} → {valor}")
+            if columna == "descripcion_limpia":
+                nuevo = valor
+            else:
+                nuevo = float(valor.replace("€", "").replace(",", ".").strip())
+            valor_original = str(item.get(_ORIGEN_CAMPO.get(columna, ""), ""))
+            await db.registrar_correccion(linea_id, columna, valor_original, str(nuevo))
+            await db.actualizar_linea_albaran(linea_id, **{columna: nuevo, "requiere_revision": False})
+            resultados.append(f"✓ {descripcion}: {nombre_campo} → {valor}")
+        except ValueError:
+            resultados.append(f"✗ No entendí «{valor}» como {nombre_campo} de '{descripcion}'.")
         except Exception as e:
             logger.error("Error aplicando corrección: %s", e)
-            resultados.append(f"Error corrigiendo '{descripcion}': {e}")
+            resultados.append(f"✗ Error corrigiendo '{descripcion}': {e}")
 
-    await update.message.reply_text("Correcciones aplicadas:\n" + "\n".join(resultados))
+    await update.message.reply_text("\n".join(resultados))
+
+
+# ── Entrada manual de albaranes (/manual) ───────────────────────────────────────
+
+async def cmd_manual(update: Update, context: CallbackContext) -> None:
+    if not _usuario_autorizado(update):
+        await _rechazar(update)
+        return
+    chat_id = update.effective_chat.id
+    # Si había una confirmación de líneas pendiente, el flujo manual tiene prioridad.
+    _pending_confirmations.pop(chat_id, None)
+    texto = await manual_albaran.iniciar(chat_id)
+    await update.message.reply_text(texto)
+
+
+async def cmd_cancelar(update: Update, context: CallbackContext) -> None:
+    if not _usuario_autorizado(update):
+        await _rechazar(update)
+        return
+    chat_id = update.effective_chat.id
+    if manual_albaran.flujo_activo(chat_id):
+        await update.message.reply_text(manual_albaran.cancelar(chat_id))
+    else:
+        await update.message.reply_text("No hay ninguna entrada manual en curso.")
+
+
+async def cmd_corregir(update: Update, context: CallbackContext) -> None:
+    if not _usuario_autorizado(update):
+        await _rechazar(update)
+        return
+    chat_id = update.effective_chat.id
+    if manual_albaran.flujo_activo(chat_id):
+        await update.message.reply_text(manual_albaran.corregir_ultimo(chat_id))
+    else:
+        await update.message.reply_text("No hay ninguna entrada manual en curso.")
 
 
 # ── Manejador de fotos ────────────────────────────────────────────────────────
@@ -239,6 +325,21 @@ async def handle_photo(update: Update, context: CallbackContext) -> None:
         await _rechazar(update)
         return
     chat_id = update.effective_chat.id
+
+    # Si hay una entrada manual en curso, la foto va al flujo (paso 6), no al OCR.
+    if manual_albaran.flujo_activo(chat_id):
+        try:
+            file = await context.bot.get_file(update.message.photo[-1].file_id)
+            imagen_bytes = bytes(await file.download_as_bytearray())
+        except Exception as e:
+            await update.message.reply_text(f"Error descargando la imagen: {e}")
+            return
+        respuesta = await manual_albaran.manejar_foto(chat_id, imagen_bytes)
+        await update.message.reply_text(
+            respuesta or "Estás en una entrada manual. Termina con FIN/OK o escribe /cancelar."
+        )
+        return
+
     foto = update.message.photo[-1]
 
     try:
@@ -294,6 +395,12 @@ async def handle_text(update: Update, context: CallbackContext) -> None:
         return
 
     chat_id = update.effective_chat.id
+
+    # Entrada manual en curso: tiene prioridad sobre todo lo demás.
+    if manual_albaran.flujo_activo(chat_id):
+        respuesta = await manual_albaran.manejar_texto(chat_id, update.message.text)
+        await update.message.reply_text(respuesta)
+        return
 
     # Comprobar confirmación pendiente
     conf = _pending_confirmations.get(chat_id)
@@ -425,6 +532,9 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("manual", cmd_manual))
+    app.add_handler(CommandHandler("cancelar", cmd_cancelar))
+    app.add_handler(CommandHandler("corregir", cmd_corregir))
     app.add_handler(CommandHandler("estado", cmd_estado))
     app.add_handler(CommandHandler("resumen", cmd_resumen))
     app.add_handler(CommandHandler("proveedores", cmd_proveedores))

@@ -24,7 +24,30 @@
 - (ninguno)
 
 ### ⏳ Pendiente
-- (ninguno)
+
+#### 1. Comando /corregir — corrección de datos tras el procesado
+Permitir al usuario corregir datos extraídos incorrectamente sin salir de Telegram.
+Hay dos niveles:
+- **Correcciones de línea** (numero_lote, caducidad, cantidad, precio_unitario, descripcion_limpia): afectan solo a ese albarán. Flujo: `/corregir 1 lote 27` → valida campo/valor → UPDATE en lineas_albaran → confirma al usuario → registra en tabla correcciones.
+- **Corrección de proveedor** (nombre, NIF): afecta a todos los albaranes históricos del proveedor. Flujo: `/corregir proveedor "Nombre Correcto"` → si el nombre correcto ya existe en BD → fusionar proveedores y eliminar el duplicado; si no existe → renombrar. Requiere confirmación explícita antes de ejecutar.
+- Todas las correcciones quedan auditadas en la tabla `correcciones` (campo, valor_original, valor_corregido, fecha).
+
+#### 2. Manejo de albaranes manuscritos de proveedores problemáticos
+Para proveedores que escriben habitualmente a mano y donde el OCR falla con frecuencia:
+- **Plantilla por proveedor**: almacenar en BD los productos habituales del proveedor y su formato típico. El LLM se apoya en esta plantilla para resolver ambigüedades del OCR (p.ej. "Qso Frsc 2kg" → "Queso Fresco 2kg" porque está en la plantilla).
+- **Modo revisión forzada**: marcar ciertos proveedores como `revision_siempre=true`. Para esos proveedores, todas las líneas se envían al usuario para confirmación antes de guardarse definitivamente, independientemente de la confianza del OCR.
+- **Fallback texto + foto**: si el OCR falla del todo, el usuario puede reenviar la foto acompañada de un texto con los datos clave y el bot usa ese texto como fuente principal.
+- Pendiente decidir: ¿cuántos proveedores problemáticos hay y cuáles son? Esto determina si merece la pena la plantilla o basta con el modo revisión forzada.
+
+#### 3. Menú de comandos / para el usuario
+Ampliar los comandos disponibles en el bot para facilitar el uso diario:
+- `/corregir` — corregir datos de un albarán reciente (ver punto 1)
+- `/proveedor [nombre]` — ficha completa del proveedor: albaranes, gasto total, productos más comprados
+- `/precio [producto]` — evolución histórica del precio de un producto
+- `/pendientes` — lista de líneas marcadas como "requiere revisión" aún no corregidas
+- `/mes` — resumen rápido del mes en curso: gasto total, top proveedores, alertas de precio activas
+- `/exportar` — generar CSV o texto con los albaranes del mes para contabilidad
+- Valorar añadir `/ayuda` con descripción de todos los comandos disponibles
 
 ### Correcciones de datos — 2026-05-19
 
@@ -236,3 +259,35 @@ pip install -r requirements.txt
 # Rellenar .env con las keys
 python -m src.bot
 ```
+
+---
+
+## 🔧 Sesión 2026-06-29 — Robustez de extracción + entrada manual + ingesta limpia
+
+### Parte 1 — Pipeline impecable (ver TEST_RESULTS.md)
+Diagnóstico de los 11 albaranes de prueba y corrección de causas raíz:
+- **Validación IVA-aware** (`_reconciliar_lineas_total`): la suma de líneas es la base; se
+  reconcilia contra base_imponible / total-IVA / total. Eliminó 8 falsos `total_no_cuadra`.
+- **importe_neto kg-aware** (`_resolver_precio_neto` + `_cantidad_facturable`/`_bases_importe`):
+  se conserva el importe impreso; cantidad/unidad se alinean a kg cuando se cobra por peso.
+- **Truncación JSON**: `max_tokens` 4096→8192 + `_recuperar_lineas_truncadas` (De Bandera,
+  18 líneas, dejó de perderse).
+- **base_imponible coherente** = suma de líneas verificada.
+- **Separador de miles** es-ES en `_parsear_numero`.
+- **Dedup**: índice UNIQUE parcial `(proveedor_id, numero_albaran_norm)` como backstop.
+- **Backfill de NIF** placeholder; **bug de `intentos`** corregido.
+
+### Parte 2 — Entrada manual (`/manual`)
+`src/manual_albaran.py`: máquina de estados conversacional (proveedor→cabecera→productos→
+total→pago→foto→confirmación), timeout 15 min, `/corregir`, `/cancelar`, alta de proveedor
+nuevo, foto opcional a Storage, dedup, `origen='manual'`. Migración: `albaranes.origen TEXT`.
+Tests: `tests/test_manual_flow.py` (9). Suite total: 31 verde.
+
+### Ingesta real
+BD vaciada y repoblada con los 9 albaranes no-manuscritos vía pipeline real
+(`scripts/ingest_real.py`). Fidelidad BD⟷original verificada al 100% (`scripts/verify_db.py`):
+68/68 líneas coherentes, 9/9 dedup. Los 2 manuscritos se insertan por Telegram.
+
+### Pendiente de hardening (no bloquea datos)
+RLS deshabilitado + SQL por f-string (revisar antes de exponer a terceros); slot único de
+confirmaciones en ráfaga; concurrencia `/manual`.

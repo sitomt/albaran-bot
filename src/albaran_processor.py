@@ -77,6 +77,8 @@ class LineaAlbaranLLM(BaseModel):
     cantidad: float
     unidad: str | None = None
     precio_unitario: float | None = None
+    precio_tarifa: float | None = None   # columna TARIFA / precio de lista (bruto), transitorio
+    precio_neto: float | None = None     # columna NETO / PRECIO FINAL explícita, transitorio
     importe_neto: float | None = None
     peso_unitario_g: float | None = None
     unidades_por_envase: int | None = None
@@ -105,7 +107,7 @@ class LineaAlbaranLLM(BaseModel):
             raise ValueError("cantidad debe ser > 0")
         return v
 
-    @field_validator("precio_unitario", "importe_neto", "peso_unitario_g", "peso_total_kg", "volumen_unitario_l", "descuento_pct", mode="before")
+    @field_validator("precio_unitario", "precio_tarifa", "precio_neto", "importe_neto", "peso_unitario_g", "peso_total_kg", "volumen_unitario_l", "descuento_pct", mode="before")
     @classmethod
     def limpiar_numerico(cls, v: Any) -> float | None:
         return _parsear_numero(v)
@@ -165,6 +167,7 @@ class AlbaranLLM(BaseModel):
 
 class ResultadoProcesamiento(BaseModel):
     albaran_id: str
+    proveedor_id: str
     proveedor_nombre: str
     numero_albaran: str | None
     fecha: str
@@ -185,14 +188,32 @@ class ResultadoProcesamiento(BaseModel):
 # ── Utilidades ────────────────────────────────────────────────────────────────
 
 def _parsear_numero(v: Any) -> float | None:
+    """Parsea números en formato es-ES, distinguiendo separador de miles del decimal.
+
+    '1.234,56' → 1234.56 (punto = miles, coma = decimal)
+    '1,234.56' → 1234.56 (coma = miles, punto = decimal)
+    '46,75'    → 46.75   |  '1.81' → 1.81  |  '1234' → 1234
+    Sin esta distinción, '1.234,56' se rompía (→ None) y se perdían precios ≥ 1.000€.
+    """
     if v is None:
         return None
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, str):
-        cleaned = v.replace("€", "").replace(",", ".").replace(" ", "").strip()
+        s = v.replace("€", "").replace(" ", "").strip()
+        if not s:
+            return None
+        if "," in s and "." in s:
+            # El separador que aparece más a la derecha es el decimal.
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")   # punto = miles
+            else:
+                s = s.replace(",", "")                       # coma = miles
+        elif "," in s:
+            s = s.replace(",", ".")                          # coma decimal
+        # Solo puntos o sin separador → se asume punto decimal (se deja igual).
         try:
-            return float(cleaned)
+            return float(s)
         except ValueError:
             return None
     return None
@@ -212,7 +233,141 @@ async def _con_reintento(func: Callable, *args: Any, max_intentos: int = 3, **kw
     raise ultimo_error
 
 
+# ── Resolución determinista del precio neto ─────────────────────────────────────
+
+def _cantidad_facturable(linea: "LineaAlbaranLLM") -> float:
+    """Cantidad sobre la que se calcula el importe de la línea (mejor estimación).
+
+    Si el producto se factura por peso (hay peso_total_kg y la unidad NO es ya kg —
+    p.ej. carnes vendidas como "2 uds" pero cobradas por 18,60 kg), el importe se
+    calcula sobre los kg, no sobre las unidades. En el resto de casos, la cantidad.
+    """
+    if linea.peso_total_kg and linea.peso_total_kg > 0 and linea.unidad != "kg":
+        return linea.peso_total_kg
+    return linea.cantidad
+
+
+def _bases_importe(linea: "LineaAlbaranLLM") -> list[float]:
+    """
+    Cantidades plausibles sobre las que el albarán pudo calcular el importe de la línea.
+    Una línea cuadra si su importe coincide con precio × (alguna de estas bases):
+      - cantidad (uds o kg directos),
+      - peso_total_kg (columna KGRS cuando el producto se cobra por peso),
+      - peso_unitario_g/1000 × cantidad (cubo/bandeja de N kg cobrado por kg, p.ej.
+        "Queso cubo 3,5kg" → 1 ud × 3,5 kg).
+    """
+    bases: list[float] = []
+    if linea.cantidad:
+        bases.append(linea.cantidad)
+    if linea.peso_total_kg and linea.peso_total_kg > 0:
+        bases.append(linea.peso_total_kg)
+    if linea.peso_unitario_g and linea.peso_unitario_g > 0:
+        bases.append(linea.peso_unitario_g / 1000.0 * (linea.cantidad or 1))
+    return bases or [linea.cantidad or 0]
+
+
+def _resolver_precio_neto(linea: "LineaAlbaranLLM") -> None:
+    """Fija precio_unitario (neto) e importe_neto de forma determinista, mutando la línea.
+
+    Regla "el neto prevalece SIEMPRE":
+      1. Si hay columna NETO explícita (precio_neto) → ese es el precio_unitario.
+      2. Si no, pero hay descuento_pct > 0 y precio_tarifa → calcular tarifa × (1 - dto/100).
+      3. Si no → usar precio_tarifa (o el precio_unitario que viniera).
+    No depende de que el LLM "elija" la columna correcta: solo de que transcriba lo que ve.
+
+    Para importe_neto: el valor IMPRESO en el albarán es la verdad. Solo se sobreescribe
+    cuando falta o cuando es claramente el importe BRUTO (tarifa × cantidad), nunca por el
+    simple hecho de no coincidir con neto × cantidad (eso rompía las líneas por kg).
+    """
+    tarifa = linea.precio_tarifa if linea.precio_tarifa and linea.precio_tarifa > 0 else linea.precio_unitario
+    dto = linea.descuento_pct or 0.0
+
+    if linea.precio_neto and linea.precio_neto > 0:
+        neto = linea.precio_neto
+    elif tarifa and dto > 0:
+        neto = round(tarifa * (1 - dto / 100.0), 4)
+    else:
+        neto = tarifa
+
+    linea.precio_unitario = neto
+
+    if not neto:
+        return
+
+    qty = _cantidad_facturable(linea)
+    esperado_neto = round(neto * qty, 2) if qty else None
+
+    # 1) Importe ausente → calcular desde el neto.
+    if not linea.importe_neto or linea.importe_neto <= 0:
+        linea.importe_neto = esperado_neto
+    # 2) Importe impreso ya cuadra con el neto → conservar tal cual (valor impreso).
+    elif esperado_neto and abs(linea.importe_neto - esperado_neto) / max(esperado_neto, 0.01) <= 0.02:
+        pass
+    # 3) Importe impreso == BRUTO (tarifa × cantidad) → reemplazar por el neto.
+    elif tarifa and qty and round(tarifa * qty, 2) and \
+            abs(linea.importe_neto - round(tarifa * qty, 2)) / max(round(tarifa * qty, 2), 0.01) <= 0.02:
+        linea.importe_neto = esperado_neto
+    # 4) En cualquier otro caso, conservar el importe impreso; la validación decidirá.
+
+    # En TODAS las rutas: alinear cantidad/unidad si la línea se cobra por peso.
+    _alinear_cantidad_unidad(linea)
+
+
+def _alinear_cantidad_unidad(linea: "LineaAlbaranLLM") -> None:
+    """
+    Si la línea se cobra por PESO pero el LLM dejó cantidad en uds (p.ej. Cordero
+    '2 ud' que en realidad son 18,60 kg, o 'Queso cubo 3,5 kg' como '1 ud'),
+    reescribe cantidad = kg y unidad = 'kg' para que en BD se cumpla SIEMPRE
+    precio_unitario × cantidad = importe_neto y las consultas por kg sean correctas.
+    """
+    if not (linea.precio_unitario and linea.precio_unitario > 0 and linea.importe_neto):
+        return
+    qty_real = linea.importe_neto / linea.precio_unitario
+    if not linea.cantidad or abs(qty_real - linea.cantidad) / linea.cantidad <= 0.02:
+        return  # la cantidad ya cuadra con el importe
+    peso_g = (linea.peso_unitario_g / 1000.0 * (linea.cantidad or 1)) if linea.peso_unitario_g else None
+    for cand in (linea.peso_total_kg, peso_g):
+        if cand and cand > 0 and abs(qty_real - cand) / cand <= 0.02:
+            linea.cantidad = round(cand, 3)
+            linea.unidad = "kg"
+            if not linea.peso_total_kg or linea.peso_total_kg <= 0:
+                linea.peso_total_kg = round(cand, 3)
+            return
+
+
 # ── Validación de línea ───────────────────────────────────────────────────────
+
+def _reconciliar_lineas_total(albaran: "AlbaranLLM") -> tuple[bool, float]:
+    """
+    Comprueba si la suma de importes netos de línea (= base imponible) cuadra con el
+    documento, TOLERANDO el IVA. La suma de líneas es SIN IVA, mientras que `total` lo
+    incluye; comparar directamente daba falsos positivos masivos.
+
+    Acepta si la suma cuadra (±5%) con CUALQUIERA de los objetivos plausibles:
+      - base_imponible (cuando el LLM lo leyó bien),
+      - total - total_iva,
+      - total (albaranes sin IVA).
+    Devuelve (cuadra, suma_lineas).
+    """
+    suma = round(sum(l.importe_neto or 0 for l in albaran.lineas), 2)
+    if suma <= 0:
+        return True, suma  # sin importes que comparar (p.ej. manuscrito sin importes)
+
+    # Sin TOTAL impreso no reconciliamos: base_imponible sola es señal débil (el LLM la
+    # inventa/lee mal en albaranes internos sin pie de totales). Las líneas ya se validan
+    # una a una en _validar_linea, así que un error real de línea se detecta igual.
+    if not albaran.total or albaran.total <= 0:
+        return True, suma
+
+    objetivos: list[float] = [albaran.total]
+    if albaran.total_iva:
+        objetivos.append(albaran.total - albaran.total_iva)
+    if albaran.base_imponible and albaran.base_imponible > 0:
+        objetivos.append(albaran.base_imponible)
+
+    mejor = min(abs(suma - o) / o for o in objetivos if o > 0)
+    return mejor <= 0.05, suma
+
 
 def _validar_linea(linea: "LineaAlbaranLLM") -> tuple[bool, str]:
     """Retorna (ok, motivo). Si ok=False, la línea necesita revisión."""
@@ -222,13 +377,20 @@ def _validar_linea(linea: "LineaAlbaranLLM") -> tuple[bool, str]:
         return False, "cantidad inválida"
     if not linea.nombre_producto or not linea.nombre_producto.strip():
         return False, "nombre producto vacío"
-    if linea.precio_unitario and linea.importe_neto:
-        # precio_unitario SIEMPRE es el precio neto (ya descontado). Validar directamente.
-        if linea.peso_total_kg and linea.unidad == 'ud':
-            esperado = linea.precio_unitario * linea.peso_total_kg
-        else:
-            esperado = linea.precio_unitario * linea.cantidad
-        if linea.importe_neto > 0 and abs(esperado - linea.importe_neto) / linea.importe_neto > 0.05:
+    # Detección del bug silencioso: hay descuento pero el neto sigue igual a la tarifa bruta.
+    if (
+        linea.descuento_pct and linea.descuento_pct > 0
+        and linea.precio_tarifa and linea.precio_unitario
+        and abs(linea.precio_unitario - linea.precio_tarifa) / linea.precio_tarifa < 0.005
+    ):
+        return False, f"descuento {linea.descuento_pct}% no aplicado (neto = tarifa)"
+    if linea.precio_unitario and linea.importe_neto and linea.importe_neto > 0:
+        # precio_unitario SIEMPRE es el neto. La línea cuadra si el importe coincide con
+        # precio × (cualquier base plausible de cantidad/peso); así una línea cobrada por
+        # kg no se marca por error solo porque la unidad sea "ud".
+        mejor = min(abs(linea.precio_unitario * b - linea.importe_neto) for b in _bases_importe(linea))
+        if mejor / linea.importe_neto > 0.05:
+            esperado = linea.precio_unitario * _cantidad_facturable(linea)
             return False, f"importe no cuadra ({esperado:.2f} calculado vs {linea.importe_neto:.2f} en albarán)"
     return True, ""
 
@@ -258,8 +420,10 @@ Extrae TODOS los datos del albarán y devuelve JSON con esta estructura exacta:
       "descripcion_original": "descripción completa tal como aparece",
       "cantidad": número,
       "unidad": "kg" | "ud" | "l" | "caja" según corresponda,
-      "precio_unitario": precio neto por unidad (ya con descuento aplicado si lo hay) o null,
-      "importe_neto": importe total de la línea o null,
+      "precio_tarifa": precio de la columna TARIFA / precio de lista (bruto, antes de descuento) o null,
+      "precio_neto": precio de la columna NETO / PRECIO FINAL si aparece explícita en el albarán, o null si no existe esa columna,
+      "precio_unitario": copia aquí el mismo valor de precio_neto si existe; si no, copia precio_tarifa,
+      "importe_neto": importe total de la línea tal como aparece o null,
       "peso_unitario_g": gramos por unidad si aparece (ej: 150g → 150) o null,
       "unidades_por_envase": unidades si aparece (ej: (50 unid) → 50) o null,
       "peso_total_kg": peso total en kg o null,
@@ -282,20 +446,26 @@ Ejemplo: "IVA 10% 307,53€ = 30,75€" y "IVA 4% 30,87€ = 1,23€" →
 Si solo hay un tipo, igual extráelo: [{"tipo": 10, "base": 307.53, "cuota": 30.75}]
 Si no aparece desglose de IVA, pon detalle_iva: null.
 
-REGLA CRÍTICA — PRECIO UNITARIO (MUY IMPORTANTE):
-precio_unitario es el precio NETO real que se paga, es decir, el precio después de aplicar el descuento.
-descuento_pct es solo informativo para auditoría; NO lo uses para calcular precio_unitario.
+REGLA CRÍTICA — PRECIOS POR COLUMNA (MUY IMPORTANTE):
+NO decidas ni calcules el precio neto. Tu trabajo es SOLO TRANSCRIBIR cada columna a su campo:
+  - columna TARIFA / precio de lista / precio bruto  → precio_tarifa
+  - columna DTO% / descuento                          → descuento_pct
+  - columna NETO / PRECIO NETO / PRECIO FINAL          → precio_neto (solo si existe esa columna)
 
-Si el albarán tiene columnas separadas (TARIFA / DTO% / PRECIO NETO o similar):
-  → usa siempre el valor de la columna NETO/PRECIO FINAL como precio_unitario
-  → NUNCA uses la columna TARIFA como precio_unitario
-  Ejemplo: TARIFA=7,74 | DTO=15% | NETO=6,58 → precio_unitario: 6.58, descuento_pct: 15
+Copia los números TAL CUAL los ves, sin hacer cuentas. El sistema aplicará el descuento después.
 
-Si solo hay un precio y un descuento (sin columna neto explícita):
-  → calcula tú el neto: precio_unitario = precio × (1 - dto/100)
-  Ejemplo: precio tarifa 2,01€ con 10% dto → precio_unitario: 1.81, descuento_pct: 10
+Si el albarán tiene columnas separadas (TARIFA / DTO% / NETO o similar):
+  Ejemplo: TARIFA=7,74 | DTO=15% | NETO=6,58 →
+    precio_tarifa: 7.74, descuento_pct: 15, precio_neto: 6.58, precio_unitario: 6.58
 
-Verificación obligatoria: precio_unitario × cantidad ≈ importe_neto (tolerancia ±5%)
+Si solo hay un precio y un descuento (SIN columna neto explícita):
+  → precio_tarifa: el precio que ves, descuento_pct: el dto, precio_neto: null
+  Ejemplo: precio 2,01€ con 10% dto → precio_tarifa: 2.01, descuento_pct: 10, precio_neto: null, precio_unitario: 2.01
+
+Si solo hay un precio y ningún descuento:
+  → precio_tarifa: el precio, descuento_pct: null, precio_neto: null, precio_unitario: el precio
+
+NUNCA inventes una columna NETO si no aparece: en ese caso precio_neto debe ser null.
 
 REGLA CRÍTICA — COLUMNAS DE PESO (KGRS / KG / KILOS / PESO):
 Si el albarán tiene una columna llamada KGRS, KG, KILOS, PESO o similar:
@@ -348,10 +518,18 @@ REGLAS ADICIONALES:
 
 CAMPO CONFIANZA POR LÍNEA:
 Para cada línea, devolver campo "confianza" (0-100):
-- 100: datos completamente claros y legibles
+- 100: datos completamente claros y legibles (texto impreso nítido)
 - 70-99: alguna ambigüedad menor (texto algo borroso pero identificable)
 - 50-69: dato inferido o poco legible
 - <50: muy dudoso, podría ser incorrecto
+
+REGLA CRÍTICA — DOCUMENTOS MANUSCRITOS / ILEGIBLES:
+Si el documento está escrito A MANO, o la línea procede de texto manuscrito, borroso,
+tachado o de difícil lectura, asigna confianza < 50 a esas líneas (NO 100). Es preferible
+marcar para revisión que dar por bueno un dato dudoso. Si un campo concreto (nombre,
+cantidad, precio) no se puede leer con seguridad, pon null en ese campo — NUNCA lo inventes.
+Un nombre de producto que quede como sigla suelta o ilegible (p.ej. "C N P") debe llevar
+confianza baja para que el usuario lo verifique.
 
 CORRECCIÓN DE ERRATAS:
 Antes de devolver, revisar erratas ortográficas obvias en nombres de productos:
@@ -441,40 +619,109 @@ async def _clasificar_documento(imagen_b64: str, client: Mistral) -> dict:
     }
 
 
+def _escapar_control(content: str) -> str:
+    """Escapa caracteres de control literales que el LLM mete sin escapar dentro de strings."""
+    result = []
+    in_string = False
+    i = 0
+    while i < len(content):
+        c = content[i]
+        if in_string:
+            if c == '\\' and i + 1 < len(content):
+                result.append(c)
+                result.append(content[i + 1])
+                i += 2
+                continue
+            elif c == '"':
+                in_string = False
+                result.append(c)
+            elif ord(c) < 0x20:
+                _esc = {'\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f'}
+                result.append(_esc.get(c, f'\\u{ord(c):04x}'))
+            else:
+                result.append(c)
+        else:
+            if c == '"':
+                in_string = True
+            result.append(c)
+        i += 1
+    return ''.join(result)
+
+
+def _recuperar_lineas_truncadas(content: str) -> dict | None:
+    """
+    Recupera un JSON cortado por max_tokens: conserva la cabecera y todos los objetos de
+    línea COMPLETOS dentro del array "lineas", descartando el último objeto a medias.
+    Garantiza que un albarán largo nunca se pierda entero por truncación.
+    """
+    m = re.search(r'"lineas"\s*:\s*\[', content)
+    if not m:
+        return None
+    arr_start = m.end()
+    depth = 0
+    in_str = False
+    esc = False
+    start: int | None = None
+    objetos: list[str] = []
+    i = arr_start
+    while i < len(content):
+        c = content[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objetos.append(content[start:i + 1])
+                    start = None
+            elif c == ']' and depth == 0:
+                break
+        i += 1
+    if not objetos:
+        return None
+    candidato = content[:arr_start] + ",".join(objetos) + "]}"
+    try:
+        return json.loads(candidato)
+    except json.JSONDecodeError:
+        return None
+
+
 def _parse_json_robusto(content: str) -> dict:
     """
-    Parsea JSON del LLM tolerando caracteres de control literales dentro de strings.
-    El LLM a veces incluye newlines o tabs sin escapar en campos como descripcion_original.
+    Parsea JSON del LLM de forma tolerante:
+      1. Intento directo.
+      2. Escapando caracteres de control literales dentro de strings.
+      3. Recuperando líneas completas si la respuesta llegó truncada (max_tokens).
     """
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        # Escapar caracteres de control dentro de strings JSON
-        result = []
-        in_string = False
-        i = 0
-        while i < len(content):
-            c = content[i]
-            if in_string:
-                if c == '\\' and i + 1 < len(content):
-                    result.append(c)
-                    result.append(content[i + 1])
-                    i += 2
-                    continue
-                elif c == '"':
-                    in_string = False
-                    result.append(c)
-                elif ord(c) < 0x20:
-                    _esc = {'\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f'}
-                    result.append(_esc.get(c, f'\\u{ord(c):04x}'))
-                else:
-                    result.append(c)
-            else:
-                if c == '"':
-                    in_string = True
-                result.append(c)
-            i += 1
-        return json.loads(''.join(result))
+        pass
+
+    escaped = _escapar_control(content)
+    try:
+        return json.loads(escaped)
+    except json.JSONDecodeError:
+        pass
+
+    recuperado = _recuperar_lineas_truncadas(escaped)
+    if recuperado is not None:
+        logger.warning("JSON del LLM truncado/dañado — recuperadas %d líneas completas", len(recuperado.get("lineas", [])))
+        return recuperado
+
+    # Sin recuperación posible: relanzar el error original para que el pipeline lo gestione.
+    return json.loads(escaped)
 
 
 async def _extraer_datos_llm(ocr_text: str, client: Mistral) -> dict:
@@ -487,9 +734,9 @@ async def _extraer_datos_llm(ocr_text: str, client: Mistral) -> dict:
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=8192,
         ),
-        timeout=45,
+        timeout=60,
     )
     return _parse_json_robusto(response.choices[0].message.content)
 
@@ -512,25 +759,13 @@ async def procesar_albaran(
     imagen_url: str | None = None
 
     try:
-        # a+c) Upload a Storage y OCR en paralelo — OCR usa base64 en memoria, no depende del upload
+        # a) OCR — la imagen NO se sube a Storage todavía. Solo se subirá si el albarán
+        # se guarda con éxito (no duplicado, legible, válido), para no dejar huérfanas.
         await db.actualizar_job(job_id, estado="procesando")
         imagen_b64 = base64.b64encode(imagen_bytes).decode()
-        await progress_callback("Leyendo y subiendo imagen...")
+        await progress_callback("Leyendo imagen...")
 
-        async def _subir_imagen_safe() -> str | None:
-            ruta = f"albaranes/{chat_id}/{job_id}.jpg"
-            try:
-                url = await db.subir_imagen("albaranes", ruta, imagen_bytes)
-                await db.actualizar_job(job_id, imagen_url=url)
-                return url
-            except Exception as e:
-                logger.warning("No se pudo subir imagen: %s — continuando sin URL", e)
-                return None
-
-        imagen_url, ocr_text = await asyncio.gather(
-            _subir_imagen_safe(),
-            _con_reintento(_ocr_imagen, imagen_b64, mistral),
-        )
+        ocr_text = await _con_reintento(_ocr_imagen, imagen_b64, mistral)
 
         if not ocr_text or not ocr_text.strip():
             raise ValueError("El OCR no extrajo texto del documento. Verifica que la imagen sea legible.")
@@ -549,6 +784,10 @@ async def procesar_albaran(
         raw_data = await _con_reintento(_extraer_datos_llm, ocr_text, mistral)
         albaran_data = AlbaranLLM.model_validate(raw_data)
 
+        # d1) Resolver precio NETO de forma determinista (el neto prevalece SIEMPRE)
+        for linea in albaran_data.lineas:
+            _resolver_precio_neto(linea)
+
         # d2) Validación mínima del JSON extraído
         ok_minimo, motivo_minimo = _validar_datos_minimos(albaran_data)
         if not ok_minimo:
@@ -559,17 +798,33 @@ async def procesar_albaran(
                 f"(Detalle: {motivo_minimo})"
             )
 
-        # e) Validar suma de líneas vs total
+        # e) Validar suma de líneas vs total (TOLERANDO el IVA: la suma de líneas es la base)
         lineas_con_revision = 0
-        if albaran_data.total and albaran_data.lineas:
-            suma_lineas = sum(l.importe_neto or 0 for l in albaran_data.lineas)
-            if suma_lineas > 0:
-                diferencia_pct = abs(suma_lineas - albaran_data.total) / albaran_data.total
-                if diferencia_pct > 0.05:
-                    logger.warning(
-                        "Discrepancia total: suma líneas=%.2f, total albarán=%.2f (%.1f%%)",
-                        suma_lineas, albaran_data.total, diferencia_pct * 100
-                    )
+        if albaran_data.lineas:
+            total_cuadra, suma_lineas = _reconciliar_lineas_total(albaran_data)
+            if not total_cuadra:
+                logger.warning(
+                    "Discrepancia total: suma líneas=%.2f no cuadra con base/total del albarán Nº %s",
+                    suma_lineas, albaran_data.numero_albaran,
+                )
+                lineas_con_revision += 1
+            elif suma_lineas > 0 and (
+                albaran_data.base_imponible is None
+                or abs(albaran_data.base_imponible - suma_lineas) / suma_lineas > 0.02
+            ):
+                # Líneas verificadas (cuadran con el documento) pero base_imponible del LLM
+                # incoherente con ellas (mal leída o alucinada). La base imponible ES, por
+                # definición, la suma de los importes netos de línea → la corregimos para que
+                # la BD sea coherente con los datos reales del albarán.
+                base_en_conflicto = albaran_data.base_imponible is not None
+                logger.info(
+                    "base_imponible corregida de %s a %.2f (= suma de líneas) en albarán Nº %s",
+                    albaran_data.base_imponible, suma_lineas, albaran_data.numero_albaran,
+                )
+                albaran_data.base_imponible = suma_lineas
+                # Si el LLM dio una base en conflicto y NO hay total para verificar la
+                # completitud de las líneas, marcamos revisión en vez de corregir en silencio.
+                if base_en_conflicto and albaran_data.total is None:
                     lineas_con_revision += 1
 
         # f) Proveedor — el primero que entra manda; nunca se modifica el NIF almacenado
@@ -610,6 +865,7 @@ async def procesar_albaran(
             await db.actualizar_job(job_id, estado="completado")
             return ResultadoProcesamiento(
                 albaran_id=duplicado["id"],
+                proveedor_id=proveedor["id"],
                 proveedor_nombre=proveedor["nombre"],
                 numero_albaran=albaran_data.numero_albaran,
                 fecha=albaran_data.fecha,
@@ -656,6 +912,7 @@ async def procesar_albaran(
                     )
                 return ResultadoProcesamiento(
                     albaran_id=existing["id"] if existing else "unknown",
+                    proveedor_id=proveedor["id"],
                     proveedor_nombre=proveedor["nombre"],
                     numero_albaran=albaran_data.numero_albaran,
                     fecha=albaran_data.fecha,
@@ -672,6 +929,16 @@ async def procesar_albaran(
                     lineas_para_confirmacion=[],
                 )
             raise
+
+        # h0) Subir imagen a Storage SOLO ahora — el albarán está guardado y no es duplicado.
+        # Si falla la subida, el albarán queda guardado sin URL (no se pierde el dato).
+        ruta = f"albaranes/{chat_id}/{job_id}.jpg"
+        try:
+            imagen_url = await db.subir_imagen("albaranes", ruta, imagen_bytes)
+            await db.actualizar_campo_albaran(albaran_row["id"], imagen_url=imagen_url)
+            await db.actualizar_job(job_id, imagen_url=imagen_url)
+        except Exception as e:
+            logger.warning("No se pudo subir imagen: %s — albarán guardado sin URL", e)
 
         # h) Normalizar y guardar líneas — 3 fases en paralelo
         await progress_callback(f"Procesando {len(albaran_data.lineas)} productos...")
@@ -756,8 +1023,9 @@ async def procesar_albaran(
         # Añadir confianza y requiere_revision a cada línea antes de insertar
         for i, (linea, linea_dict) in enumerate(zip(albaran_data.lineas, lineas_para_insertar)):
             ok, motivo = _validar_linea(linea)
+            sin_datos = linea.importe_neto is None and linea.precio_unitario is None
             linea_dict["confianza"] = linea.confianza
-            linea_dict["requiere_revision"] = not ok or linea.confianza < 70
+            linea_dict["requiere_revision"] = not ok or linea.confianza < 70 or sin_datos
 
         lineas_insertadas = await db.insertar_lineas(lineas_para_insertar)
 
@@ -775,6 +1043,7 @@ async def procesar_albaran(
                     "descripcion": norm_name,
                     "cantidad": linea.cantidad,
                     "precio": linea.precio_unitario,
+                    "importe": linea.importe_neto,
                     "unidad": linea.unidad,
                     "razon": razon,
                 })
@@ -799,6 +1068,7 @@ async def procesar_albaran(
 
         return ResultadoProcesamiento(
             albaran_id=albaran_row["id"],
+            proveedor_id=proveedor["id"],
             proveedor_nombre=proveedor["nombre"],
             numero_albaran=albaran_data.numero_albaran,
             fecha=albaran_data.fecha,

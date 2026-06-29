@@ -104,6 +104,15 @@ async def buscar_o_crear_proveedor(
             ]
             if v and not row.get(k)
         }
+        # Backfill de NIF: si el proveedor se creó con un NIF placeholder (porque el primer
+        # albarán traía el NIF del cliente o ninguno) y ahora llega un NIF real (no del
+        # cliente), se rellena. Solo se sobreescribe el placeholder, nunca un NIF real.
+        if (
+            nif_para_busqueda
+            and str(row.get("nif", "")).startswith("DESCONOCIDO")
+            and not str(nif_para_busqueda).startswith("DESCONOCIDO")
+        ):
+            updates["nif"] = nif_para_busqueda
         if updates:
             client = await get_client()
             res = await client.table("proveedores").update(updates).eq("id", row["id"]).execute()
@@ -344,6 +353,7 @@ async def insertar_albaran(
     imagen_url: str | None,
     detalle_iva: list[dict] | None = None,
     imagen_hash: str | None = None,
+    origen: str = "ocr",
 ) -> dict:
     client = await get_client()
     payload = {
@@ -357,6 +367,7 @@ async def insertar_albaran(
         "imagen_url": imagen_url,
         "detalle_iva": detalle_iva,
         "imagen_hash": imagen_hash,
+        "origen": origen,
     }
     res = await client.table("albaranes").insert(payload).execute()
     data = _safe_data(res, many=True)
@@ -416,6 +427,35 @@ async def subir_imagen(bucket: str, path: str, data: bytes, content_type: str = 
     return await client.storage.from_(bucket).get_public_url(path)
 
 
+async def listar_archivos_storage(bucket: str, prefix: str = "") -> list[str]:
+    """
+    Lista recursivamente todas las rutas de fichero dentro del bucket.
+    Las carpetas (item['id'] is None) se recorren; los ficheros se acumulan.
+    """
+    client = await get_client()
+    items = await client.storage.from_(bucket).list(prefix)
+    paths: list[str] = []
+    for it in items or []:
+        nombre = it.get("name")
+        if not nombre:
+            continue
+        ruta = f"{prefix}/{nombre}" if prefix else nombre
+        if it.get("id") is None:  # es carpeta
+            paths.extend(await listar_archivos_storage(bucket, ruta))
+        else:
+            paths.append(ruta)
+    return paths
+
+
+async def borrar_archivos_storage(bucket: str, paths: list[str]) -> int:
+    """Borra las rutas indicadas del bucket. Retorna cuántas se pidieron borrar."""
+    if not paths:
+        return 0
+    client = await get_client()
+    await client.storage.from_(bucket).remove(paths)
+    return len(paths)
+
+
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 
 async def crear_job(telegram_user_id: int, imagen_url: str | None = None) -> dict:
@@ -440,7 +480,8 @@ async def actualizar_job(job_id: str, **campos: Any) -> dict:
             await client.table("jobs").select("intentos").eq("id", job_id).limit(1).execute()
         )
         actual_data = _safe_data(res_actual, many=True)
-        campos["intentos"] = (actual_data[0].get("intentos") if actual_data else 0) or 0 + 1
+        actual = (actual_data[0].get("intentos") if actual_data else 0) or 0
+        campos["intentos"] = actual + 1
     res = await client.table("jobs").update(campos).eq("id", job_id).execute()
     data = _safe_data(res, many=True)
     return data[0] if data else {}
@@ -576,4 +617,43 @@ async def ejecutar_sql(sql: str) -> list[dict]:
             return parsed if isinstance(parsed, list) else []
         except Exception:
             return []
+
+
+# ── Corrección de proveedor ───────────────────────────────────────────────────
+
+async def buscar_proveedores_similares(texto: str) -> list[dict]:
+    """Devuelve proveedores cuyo nombre contenga 'texto' (case-insensitive)."""
+    client = await get_client()
+    res = await client.table("proveedores").select("id, nombre").ilike("nombre", f"%{texto}%").execute()
+    return _safe_data(res, many=True)
+
+
+async def listar_todos_proveedores() -> list[dict]:
+    """Devuelve todos los proveedores ordenados por nombre."""
+    client = await get_client()
+    res = await client.table("proveedores").select("id, nombre").order("nombre").execute()
+    return _safe_data(res, many=True)
+
+
+async def actualizar_nombre_proveedor(proveedor_id: str, nuevo_nombre: str) -> dict:
+    """Renombra un proveedor existente."""
+    client = await get_client()
+    res = await client.table("proveedores").update({"nombre": nuevo_nombre}).eq("id", proveedor_id).execute()
+    data = _safe_data(res, many=True)
+    return data[0] if data else {}
+
+
+async def reasignar_proveedor_albaran(albaran_id: str, nuevo_proveedor_id: str, proveedor_anterior_id: str) -> None:
+    """
+    Reasigna un albarán a otro proveedor existente.
+    Si el proveedor anterior queda sin albaranes, lo elimina.
+    """
+    client = await get_client()
+    await client.table("albaranes").update({"proveedor_id": nuevo_proveedor_id}).eq("id", albaran_id).execute()
+    # Limpiar proveedor huérfano
+    check = await client.table("albaranes").select("id").eq("proveedor_id", proveedor_anterior_id).limit(1).execute()
+    if not _safe_data(check, many=True):
+        await client.table("productos_catalogo").delete().eq("proveedor_id", proveedor_anterior_id).execute()
+        await client.table("proveedores").delete().eq("id", proveedor_anterior_id).execute()
+        logger.info("Proveedor huérfano %s eliminado tras reasignación", proveedor_anterior_id)
     return []

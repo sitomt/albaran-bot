@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 from . import supabase_client as db
 from .albaran_processor import ResultadoProcesamiento, procesar_albaran
 
@@ -52,11 +54,24 @@ def _formatear_importe(valor: float) -> str:
     return f"{valor:,.2f}€".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _formatear_respuesta(resultado: ResultadoProcesamiento) -> str:
+def _teclado_correccion_proveedor(resultado: ResultadoProcesamiento) -> InlineKeyboardMarkup:
+    """Botón inline para corregir el proveedor de un albarán procesado."""
+    albaran_short = resultado.albaran_id[:8]
+    proveedor_short = resultado.proveedor_id[:8]
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔧 Corregir proveedor",
+            callback_data=f"corr_prov:{albaran_short}:{proveedor_short}",
+        )
+    ]])
+
+
+def _formatear_respuesta(resultado: ResultadoProcesamiento) -> tuple[str, InlineKeyboardMarkup | None]:
     if resultado.es_duplicado:
         return (
             "Este albarán ya está registrado.\n"
-            "Mismo proveedor, fecha y total que un albarán procesado anteriormente."
+            "Mismo proveedor, fecha y total que un albarán procesado anteriormente.",
+            None,
         )
 
     total_str = _formatear_importe(resultado.total) if resultado.total else "—"
@@ -87,11 +102,19 @@ def _formatear_respuesta(resultado: ResultadoProcesamiento) -> str:
             f"({anterior_str} → {nuevo_str})"
         )
 
-    return "\n".join(lineas)
+    return "\n".join(lineas), _teclado_correccion_proveedor(resultado)
 
 
-def _formatear_confirmacion(resultado: ResultadoProcesamiento) -> str:
-    """Mensaje con el resultado normal + solicitud de confirmación de líneas dudosas."""
+def _formatear_cantidad(valor: float | None) -> str:
+    """36.0 → '36' ; 5.74 → '5,74' (sin ceros sobrantes, con coma decimal)."""
+    if valor is None:
+        return "—"
+    texto = f"{valor:.3f}".rstrip("0").rstrip(".")
+    return texto.replace(".", ",")
+
+
+def _formatear_confirmacion(resultado: ResultadoProcesamiento) -> tuple[str, InlineKeyboardMarkup]:
+    """Mensaje con el resultado normal + solicitud de confirmación en lenguaje sencillo."""
     partes_cabecera = []
     if resultado.numero_albaran:
         partes_cabecera.append(f"Nº {resultado.numero_albaran}")
@@ -101,27 +124,49 @@ def _formatear_confirmacion(resultado: ResultadoProcesamiento) -> str:
         partes_cabecera.append(resultado.forma_pago)
 
     total_str = _formatear_importe(resultado.total) if resultado.total else "—"
+    n = len(resultado.lineas_para_confirmacion)
+    encabezado_revision = (
+        "Hay 1 producto que quiero que revises:" if n == 1
+        else f"Hay {n} productos que quiero que revises:"
+    )
     lineas = [
         f"✓ Albarán procesado — {resultado.proveedor_nombre}",
         " | ".join(partes_cabecera),
         f"{resultado.num_lineas} productos | Total: {total_str}",
         "",
-        f"{len(resultado.lineas_para_confirmacion)} línea(s) necesitan confirmación:",
+        encabezado_revision,
     ]
     for item in resultado.lineas_para_confirmacion:
-        precio_str = f" a {_formatear_importe(item['precio'])}" if item.get('precio') else ""
-        unidad_str = f"/{item['unidad']}" if item.get('unidad') else ""
-        lineas.append(
-            f"{item['num']}. '{item['descripcion']}' × {item['cantidad']}{precio_str}{unidad_str} — {item['razon']}"
-        )
+        unidad = item.get("unidad") or "ud"
+        cant = _formatear_cantidad(item.get("cantidad"))
+        lineas.append("")
+        lineas.append(f"  {item['num']})  {item['descripcion']}")
+        if item.get("precio") and item.get("importe"):
+            lineas.append(
+                f"      {cant} {unidad} a {_formatear_importe(item['precio'])}/{unidad}"
+                f" = {_formatear_importe(item['importe'])}"
+            )
+        elif item.get("importe"):
+            lineas.append(f"      {cant} {unidad} = {_formatear_importe(item['importe'])}")
+        else:
+            lineas.append(f"      {cant} {unidad}")
+        if item.get("razon"):
+            lineas.append(f"      ({item['razon']})")
+
+    primer = resultado.lineas_para_confirmacion[0]["num"] if n else 1
     lineas.extend([
         "",
-        "Responde con correcciones si las hay:",
-        "1: nombre correcto (para corregir descripción)",
-        "1: 5 (para corregir cantidad)",
-        "O responde 'ok' si todo está bien.",
+        f'Si algo está mal, contéstame copiando una de estas frases y cambiando solo el dato'
+        f' (el "{primer}" es el número del producto):',
+        "",
+        f"  El precio del {primer} es 4,84",
+        f"  El importe del {primer} es 27,76",
+        f"  La cantidad del {primer} es 5,74",
+        f"  El nombre del {primer} es Longaniza Blanca",
+        "",
+        'Si está todo bien, contéstame:  ok',
     ])
-    return "\n".join(lineas)
+    return "\n".join(lineas), _teclado_correccion_proveedor(resultado)
 
 
 def _formatear_resumen_cola() -> str:
@@ -206,9 +251,9 @@ async def worker() -> None:
                     "lineas": resultado.lineas_para_confirmacion,
                     "timestamp": datetime.now(),
                 }
-                respuesta = _formatear_confirmacion(resultado)
+                respuesta, markup = _formatear_confirmacion(resultado)
             else:
-                respuesta = _formatear_respuesta(resultado)
+                respuesta, markup = _formatear_respuesta(resultado)
                 pendientes = _queue.qsize()
                 if pendientes > 0:
                     async with _stats_lock:
@@ -222,7 +267,7 @@ async def worker() -> None:
                     await bot.delete_message(chat_id=chat_id, message_id=progress_msg_id[0])
                 except Exception:
                     pass
-            await bot.send_message(chat_id=chat_id, text=respuesta)
+            await bot.send_message(chat_id=chat_id, text=respuesta, reply_markup=markup)
 
         except Exception as e:
             async with _stats_lock:

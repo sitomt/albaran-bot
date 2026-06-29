@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS albaranes (
     detalle_iva JSONB,                       -- [{tipo, base, cuota}] por tramo de IVA
     total NUMERIC(10,2),
     imagen_url TEXT,
-    imagen_hash TEXT UNIQUE,                 -- SHA-256 de la foto para deduplicación exacta
+    imagen_hash TEXT,                        -- SHA-256 de la foto (unicidad vía índice parcial abajo)
+    origen TEXT DEFAULT 'ocr',               -- 'ocr' (foto procesada) | 'manual' (alta por /manual)
     creado_en TIMESTAMPTZ DEFAULT now()
 );
 
@@ -119,7 +120,20 @@ CREATE TABLE IF NOT EXISTS correcciones (
 CREATE INDEX IF NOT EXISTS idx_albaranes_fecha ON albaranes(fecha DESC);
 CREATE INDEX IF NOT EXISTS idx_albaranes_proveedor_fecha ON albaranes(proveedor_id, fecha DESC);
 CREATE INDEX IF NOT EXISTS idx_albaranes_num_norm ON albaranes(numero_albaran_norm);
-CREATE INDEX IF NOT EXISTS idx_albaranes_imagen_hash ON albaranes(imagen_hash) WHERE imagen_hash IS NOT NULL;
+
+-- ── Deduplicación a nivel BD (backstop real del catch 23505; imprescindible bajo
+--    concurrencia de workers). Estos índices DEBEN existir en cualquier reprovisión.
+-- 1) Misma foto exacta (hash SHA-256).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_albaranes_imagen_hash
+    ON albaranes(imagen_hash) WHERE imagen_hash IS NOT NULL;
+-- 2) Mismo proveedor + mismo número de albarán (clave fuerte para albaranes numerados).
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_albaran_prov_numnorm
+    ON albaranes(proveedor_id, numero_albaran_norm) WHERE numero_albaran_norm <> '';
+-- 3) Mismo proveedor + fecha + total exacto (cubre albaranes sin número).
+--    NOTA: match EXACTO de total; dos entregas distintas con idéntico total el mismo
+--    día se tratarían como duplicado (raro). La capa Python añade tolerancia ±0,50€.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_albaran_duplicado
+    ON albaranes(proveedor_id, fecha, total) WHERE total IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_lineas_producto ON lineas_albaran(producto_catalogo_id);
 CREATE INDEX IF NOT EXISTS idx_productos_proveedor ON productos_catalogo(proveedor_id);
 CREATE INDEX IF NOT EXISTS idx_proveedores_nombre_norm ON proveedores(nombre_normalizado);

@@ -133,7 +133,9 @@ A) Pregunta sobre PRECIO ("¿cuánto me cuesta X?", "precio de X", "¿a cómo es
    → NO uses SUM. NO uses importe_neto.
 
 B) Pregunta sobre GASTO TOTAL ("¿cuánto gasté?", "total gastado", "¿cuánto llevo gastado?"):
-   → Usa SUM(la.importe_neto) o SUM(a.total).
+   → Por proveedor/global usa SUM(COALESCE(a.total, a.base_imponible)) — así también cuentan
+     los albaranes de entrega que no imprimen total (a.total IS NULL) usando su base imponible.
+   → Si necesitas el gasto a nivel de línea de producto, usa SUM(la.importe_neto).
 
 C) Pregunta sobre CANTIDAD ("¿cuántos kilos?", "¿cuántas unidades?", "¿cuánto he comprado?"):
    → Usa SUM(la.cantidad) o SUM(COALESCE(la.peso_total_kg, la.cantidad)) para kg.
@@ -203,7 +205,7 @@ Ejemplos:
   SELECT la.descripcion_limpia, SUM(la.cantidad) as kg_totales, la.unidad, a.fecha FROM lineas_albaran la JOIN albaranes a ON la.albaran_id = a.id WHERE la.descripcion_limpia ILIKE '%chorizo%' AND a.fecha = (SELECT MAX(a2.fecha) FROM albaranes a2 JOIN lineas_albaran la2 ON la2.albaran_id = a2.id WHERE la2.descripcion_limpia ILIKE '%chorizo%') GROUP BY la.descripcion_limpia, la.unidad, a.fecha
 
 - "¿Cuánto he gastado en Lucas Caballero este mes?"
-  SELECT p.nombre, SUM(a.total) as total_gastado FROM albaranes a JOIN proveedores p ON a.proveedor_id = p.id WHERE p.nombre ILIKE '%caballero%' AND a.fecha >= date_trunc('month', CURRENT_DATE) GROUP BY p.nombre
+  SELECT p.nombre, SUM(COALESCE(a.total, a.base_imponible)) as total_gastado FROM albaranes a JOIN proveedores p ON a.proveedor_id = p.id WHERE p.nombre ILIKE '%caballero%' AND a.fecha >= date_trunc('month', CURRENT_DATE) GROUP BY p.nombre
 
 - "¿Cómo paga Lucas Caballero?"
   SELECT a.forma_pago, a.fecha FROM albaranes a JOIN proveedores p ON a.proveedor_id = p.id WHERE p.nombre ILIKE '%caballero%' ORDER BY a.fecha DESC LIMIT 1
@@ -212,7 +214,7 @@ Ejemplos:
   SELECT la.descripcion_limpia, la.cantidad, la.unidad, COALESCE(la.peso_total_kg, la.cantidad) as cantidad_real, la.precio_unitario, a.fecha, p.nombre as proveedor FROM lineas_albaran la JOIN albaranes a ON la.albaran_id = a.id JOIN proveedores p ON a.proveedor_id = p.id WHERE la.descripcion_limpia ILIKE '%longaniza%' ORDER BY a.fecha DESC LIMIT 3
 
 - "Total gastado por proveedor este mes"
-  SELECT p.nombre, COUNT(a.id) as num_albaranes, SUM(a.total) as total FROM albaranes a JOIN proveedores p ON a.proveedor_id = p.id WHERE a.fecha >= date_trunc('month', CURRENT_DATE) GROUP BY p.nombre ORDER BY total DESC
+  SELECT p.nombre, COUNT(a.id) as num_albaranes, SUM(COALESCE(a.total, a.base_imponible)) as total FROM albaranes a JOIN proveedores p ON a.proveedor_id = p.id WHERE a.fecha >= date_trunc('month', CURRENT_DATE) GROUP BY p.nombre ORDER BY total DESC
 
 - "¿Cuánto me ahorro con los descuentos de Lucas Caballero?"
   SELECT ROUND(SUM(CASE WHEN COALESCE(la.descuento_pct,0) > 0 THEN la.precio_unitario / (1 - la.descuento_pct/100) * la.cantidad ELSE la.precio_unitario * la.cantidad END), 2) as total_sin_descuento, ROUND(SUM(la.precio_unitario * la.cantidad), 2) as total_con_descuento, ROUND(SUM(CASE WHEN COALESCE(la.descuento_pct,0) > 0 THEN (la.precio_unitario / (1 - la.descuento_pct/100) - la.precio_unitario) * la.cantidad ELSE 0 END), 2) as ahorro FROM lineas_albaran la JOIN albaranes a ON la.albaran_id = a.id JOIN proveedores p ON a.proveedor_id = p.id WHERE p.nombre ILIKE '%caballero%' AND a.fecha >= date_trunc('month', CURRENT_DATE)
