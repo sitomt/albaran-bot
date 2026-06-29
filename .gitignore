@@ -21,3 +21,6 @@ build/
 
 # Caché de OCR/LLM para el harness de test (no versionar)
 .cache_test/
+
+# Imágenes de prueba
+albaranes_test.md/
