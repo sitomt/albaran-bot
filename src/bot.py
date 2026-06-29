@@ -15,6 +15,7 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackContext,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -318,6 +319,21 @@ async def cmd_corregir(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("No hay ninguna entrada manual en curso.")
 
 
+async def handle_callback(update: Update, context: CallbackContext) -> None:
+    """Maneja los botones inline. Por ahora: 'Introducir a mano' tras un OCR fallido."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    if not _usuario_autorizado(update):
+        return
+    chat_id = update.effective_chat.id
+    if query.data == "manual_start":
+        _pending_confirmations.pop(chat_id, None)
+        texto = await manual_albaran.iniciar(chat_id)
+        await context.bot.send_message(chat_id=chat_id, text=texto)
+
+
 # ── Manejador de fotos ────────────────────────────────────────────────────────
 
 async def handle_photo(update: Update, context: CallbackContext) -> None:
@@ -540,6 +556,7 @@ def main() -> None:
     app.add_handler(CommandHandler("proveedores", cmd_proveedores))
     app.add_handler(CommandHandler("revisiones", cmd_revisiones))
     app.add_handler(CommandHandler("ayuda", cmd_ayuda))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

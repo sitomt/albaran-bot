@@ -24,7 +24,14 @@ logger = logging.getLogger(__name__)
 
 # Estado por chat_id. Estructura del flujo (ver docstring del módulo).
 _manual_flows: dict[int, dict] = {}
+# Foto cuyo OCR falló, a la espera de que el usuario decida meterla a mano (botón inline).
+_foto_pendiente: dict[int, bytes] = {}
 _TIMEOUT = timedelta(minutes=15)
+
+
+def recordar_foto_fallida(chat_id: int, imagen_bytes: bytes) -> None:
+    """Guarda la foto cuyo OCR falló para reaprovecharla si el usuario elige meterla a mano."""
+    _foto_pendiente[chat_id] = imagen_bytes
 
 _MESES = {
     "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
@@ -154,6 +161,8 @@ async def iniciar(chat_id: int) -> str:
         "timestamp": datetime.now(),
         "_proveedores": proveedores,
         "_nuevo": None,
+        # Si venimos de una foto cuyo OCR falló, la reaprovechamos (se adjunta al final).
+        "_imagen_bytes": _foto_pendiente.pop(chat_id, None),
     }
     _manual_flows[chat_id] = flow
 
@@ -162,10 +171,11 @@ async def iniciar(chat_id: int) -> str:
         cuerpo = f"Proveedores registrados:\n{listado}\n\nEscribe el número o el nombre si es uno nuevo."
     else:
         cuerpo = "No hay proveedores registrados todavía. Escribe el nombre del proveedor."
+    nota_foto = "📎 Usaré la foto que enviaste como archivo del albarán.\n\n" if flow["_imagen_bytes"] else ""
     return (
         "Vamos a registrar un albarán manualmente.\n"
         "(escribe /cancelar en cualquier momento para abortar)\n\n"
-        f"¿De qué proveedor es?\n\n{cuerpo}"
+        f"{nota_foto}¿De qué proveedor es?\n\n{cuerpo}"
     )
 
 
@@ -359,6 +369,10 @@ def _step_total(flow: dict, texto: str) -> str:
 def _step_forma_pago(flow: dict, texto: str) -> str:
     if texto.lower() not in ("no", "n"):
         flow["forma_pago"] = texto.strip()
+    # Si ya tenemos la foto (venía de un OCR fallido), saltamos el paso de foto.
+    if flow.get("_imagen_bytes"):
+        flow["step"] = "confirmacion"
+        return _resumen(flow)
     flow["step"] = "foto"
     return (
         "¿Quieres añadir una foto del albarán para archivo?\n"
@@ -414,6 +428,8 @@ def _resumen(flow: dict) -> str:
     ]
     for l in flow["lineas"]:
         lineas.append(f" · {l['nombre']} × {_cant(l['cantidad'])} a {_fmt_importe(l['precio'])}")
+    if flow.get("imagen_url") or flow.get("_imagen_bytes"):
+        lineas.append("📎 Con foto adjunta.")
     lineas.append("")
     lineas.append("Escribe OK para guardar o /cancelar para abortar.")
     return "\n".join(lineas)
@@ -466,6 +482,14 @@ async def _detectar_duplicado(proveedor_id: str, proveedor_nombre: str, fecha: s
 async def _insertar(flow: dict) -> dict:
     proveedor_id = flow["proveedor_id"]
     total = flow["total_manual"] if flow["total_manual"] is not None else _total_lineas(flow)
+
+    # Subir la foto reaprovechada (OCR fallido) si aún no se ha subido.
+    if not flow.get("imagen_url") and flow.get("_imagen_bytes"):
+        try:
+            ruta = f"albaranes/manual/{uuid.uuid4().hex}.jpg"
+            flow["imagen_url"] = await db.subir_imagen("albaranes", ruta, flow["_imagen_bytes"])
+        except Exception as e:
+            logger.warning("No se pudo subir la foto reaprovechada del albarán manual: %s", e)
 
     # Detección de duplicados ANTES de insertar (req: los manuales SÍ se comprueban)
     dup = await _detectar_duplicado(proveedor_id, flow["proveedor_nombre"], flow["fecha"], total, flow["numero_albaran"])

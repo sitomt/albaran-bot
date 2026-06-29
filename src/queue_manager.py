@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from . import supabase_client as db
+from . import manual_albaran
 from .albaran_processor import ResultadoProcesamiento, procesar_albaran
 
 if TYPE_CHECKING:
@@ -279,10 +280,28 @@ async def worker() -> None:
             except Exception:
                 pass
             try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"Error procesando el albarán: {e}\n\nRevisa la imagen e inténtalo de nuevo.",
-                )
+                error_str = str(e)
+                es_blacklist = "no es un albarán de compra" in error_str or "no se registrará" in error_str
+                if es_blacklist:
+                    # Documento que no es un albarán (nómina, factura de luz...): no ofrecer alta manual.
+                    await bot.send_message(chat_id=chat_id, text=error_str)
+                else:
+                    # No se pudo leer (manuscrito, foto difícil): ofrecer meterlo a mano reaprovechando la foto.
+                    manual_albaran.recordar_foto_fallida(chat_id, imagen_bytes)
+                    markup = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✍️ Introducir a mano", callback_data="manual_start")
+                    ]])
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "No he podido leer este albarán automáticamente "
+                            "(puede ser manuscrito o la foto es difícil de interpretar).\n\n"
+                            "¿Quieres introducirlo a mano? Es rápido: yo te guío paso a paso y "
+                            "uso esta misma foto como archivo.\n\n"
+                            "Pulsa el botón o escribe /manual."
+                        ),
+                        reply_markup=markup,
+                    )
             except Exception:
                 pass
         finally:

@@ -201,6 +201,28 @@ async def test_foto_opcional(fake_db):
     assert fake_db.albaranes[0]["imagen_url"].startswith("https://fake/")
 
 
+# ── Foto reaprovechada tras OCR fallido (botón "Introducir a mano") ──────────────
+
+async def test_foto_reaprovechada_salta_paso_foto(fake_db):
+    # Simula: el OCR falló y guardamos la foto; el usuario pulsa "Introducir a mano".
+    m.recordar_foto_fallida(CHAT, b"foto-del-albaran")
+    intro = await m.iniciar(CHAT)
+    assert "foto que enviaste" in intro.lower()
+    await m.manejar_texto(CHAT, "1")
+    await m.manejar_texto(CHAT, "100 / 01/06/2026")
+    await m.manejar_texto(CHAT, "Merluza, 5, 10.00")
+    await m.manejar_texto(CHAT, "FIN")
+    # Tras la forma de pago NO debe preguntar por foto (ya la tenemos) → resumen directo
+    await m.manejar_texto(CHAT, "OK")          # total
+    resumen = await m.manejar_texto(CHAT, "30 días")  # forma de pago → resumen
+    assert "resumen" in resumen.lower()
+    assert "foto adjunta" in resumen.lower()
+    final = await m.manejar_texto(CHAT, "OK")
+    assert "guardado" in final.lower()
+    assert fake_db.albaranes[0]["imagen_url"].startswith("https://fake/")
+    assert fake_db.albaranes[0]["origen"] == "manual"
+
+
 # ── Duplicado detectado en el segundo intento ───────────────────────────────────
 
 async def test_duplicado_detectado(fake_db):
