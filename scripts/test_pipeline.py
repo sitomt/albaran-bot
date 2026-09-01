@@ -1,244 +1,178 @@
-"""
-Harness de prueba del pipeline de albaranes en MODO TEST (sin tocar la BD).
+"""Evalúa extracciones cacheadas contra el corpus real y las reglas actuales.
 
-Procesa todas las imágenes de albaranes_test.md/ ejecutando:
-  OCR (Mistral) → extracción LLM → resolución de precio NETO → validación.
-
-Cachea el resultado del OCR y de la extracción LLM en .cache_test/ para poder
-iterar sobre la lógica Python sin volver a gastar llamadas a la API.
+No llama a Mistral ni escribe en Supabase. El modo de producción completo se
+prueba después de la migración mediante Telegram; este programa permite repetir
+la evaluación determinista sin coste y hace visibles los errores de OCR antiguos.
 
 Uso:
-  python scripts/test_pipeline.py                 # usa caché si existe
-  python scripts/test_pipeline.py --refresh-ocr   # rehace OCR + LLM
-  python scripts/test_pipeline.py --refresh-llm    # rehace solo extracción LLM
-  python scripts/test_pipeline.py --only problematico1
+  python scripts/test_pipeline.py
+  python scripts/test_pipeline.py --only Lucas --json-out runtime/golden-report.json
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
-import base64
+import copy
 import json
+import re
 import sys
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
-_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-from mistralai.client.sdk import Mistral  # noqa: E402
-
+from src.accounting_validation import validate_candidate  # noqa: E402
+from src.albaran_processor import AlbaranLLM, _resolver_precio_neto  # noqa: E402
 from src.config import settings  # noqa: E402
-from src import albaran_processor as ap  # noqa: E402
+from src.ingestion_service import _header_provenance_issues  # noqa: E402
 
-_IMG_DIR = _ROOT / "albaranes_test.md"
-_CACHE_DIR = _ROOT / ".cache_test"
-_CACHE_DIR.mkdir(exist_ok=True)
-
-_IMG_EXTS = {".jpg", ".jpeg", ".png"}
+MANIFEST = ROOT / "tests" / "fixtures" / "golden_albaranes.json"
+CACHE = ROOT / ".cache_test"
 
 
-def _listar_imagenes() -> list[Path]:
-    return sorted(
-        p for p in _IMG_DIR.iterdir()
-        if p.suffix.lower() in _IMG_EXTS and not p.name.startswith(".")
+def _normal(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _money_equal(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is right
+    return abs(Decimal(str(left)) - Decimal(str(right))) <= Decimal("0.03")
+
+
+def _load_documents(only: str | None) -> list[dict[str, Any]]:
+    documents = json.loads(MANIFEST.read_text(encoding="utf-8"))["documents"]
+    if only:
+        documents = [doc for doc in documents if only.casefold() in doc["file"].casefold()]
+    return documents
+
+
+def _header_mismatches(expected: dict[str, Any], model: AlbaranLLM) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
+    accepted_numbers = expected.get("accepted_numbers") or [expected.get("number")]
+    accepted_numbers = [value for value in accepted_numbers if value]
+    if accepted_numbers and _normal(model.numero_albaran) not in {_normal(value) for value in accepted_numbers}:
+        mismatches.append({
+            "field": "numero_albaran", "expected": accepted_numbers,
+            "observed": model.numero_albaran,
+        })
+    pairs = [
+        ("fecha", expected.get("date"), model.fecha, lambda a, b: a == b),
+        ("base_imponible", expected.get("base"), model.base_imponible, _money_equal),
+        ("total_iva", expected.get("vat"), model.total_iva, _money_equal),
+        ("total", expected.get("total"), model.total, _money_equal),
+    ]
+    for field, wanted, observed, comparator in pairs:
+        if field not in {"fecha"} and {"base_imponible": "base", "total_iva": "vat", "total": "total"}[field] not in expected:
+            continue
+        if field == "fecha" and "date" not in expected:
+            continue
+        if not comparator(wanted, observed):
+            mismatches.append({"field": field, "expected": wanted, "observed": observed})
+    return mismatches
+
+
+def evaluate_raw(
+    document: dict[str, Any], raw: dict[str, Any], *, source: str, ocr_text: str = ""
+) -> dict[str, Any]:
+    raw = copy.deepcopy(raw)
+    raw.pop("_extraction_complete", None)
+    try:
+        model = AlbaranLLM.model_validate(copy.deepcopy(raw))
+    except Exception as exc:
+        return {
+            "file": document["file"], "expected_outcome": document["expected_outcome"],
+            "source": source, "cache": "invalid", "safe_route": True, "mismatches": [],
+            "validation_codes": ["candidate_schema_invalid"], "error": str(exc)[:500],
+        }
+
+    for line in model.lineas:
+        _resolver_precio_neto(line)
+    report = validate_candidate(
+        model,
+        extraction_complete=True,
+        document_is_handwritten=bool(document.get("handwritten")),
+        # La caché antigua no conservó scores. Este 0,99 aísla la exactitud de
+        # campos; en producción una confianza ausente/baja añade otra revisión.
+        ocr_confidence=0.99,
+    )
+    mismatches = _header_mismatches(document.get("header", {}), model)
+    if ocr_text:
+        candidate = {"header": {
+            "base_imponible": model.base_imponible,
+            "total_iva": model.total_iva,
+            "total": model.total,
+        }}
+        extra_codes = {issue.code for issue in _header_provenance_issues(candidate, ocr_text)}
+    else:
+        extra_codes = set()
+    core_safe = not report.auto_confirmable or bool(mismatches)
+    human_gate = not settings.AUTO_CONFIRM_CLEAN
+    expected_caution = document["expected_outcome"] in {"review", "manual"}
+    return {
+        "file": document["file"],
+        "source": source,
+        "expected_outcome": document["expected_outcome"],
+        "cache": "loaded",
+        "provider": model.proveedor_nombre,
+        "number": model.numero_albaran,
+        "date": model.fecha,
+        "total": model.total,
+        "line_count": len(model.lineas),
+        "validation_codes": sorted({issue.code for issue in report.issues} | extra_codes),
+        "mismatches": mismatches,
+        "accounting_auto_confirmable": report.auto_confirmable and not extra_codes,
+        "human_confirmation_gate": human_gate,
+        "safe_route": (not expected_caution) or core_safe or human_gate,
+    }
+
+
+def evaluate(document: dict[str, Any]) -> dict[str, Any]:
+    raw_path = CACHE / f"{Path(document['file']).stem}.raw.json"
+    if not raw_path.exists():
+        return {
+            "file": document["file"], "expected_outcome": document["expected_outcome"],
+            "source": "legacy-cache", "cache": "missing",
+            "safe_route": document["expected_outcome"] != "confirmable",
+            "mismatches": [], "validation_codes": ["cached_extraction_missing"],
+        }
+    return evaluate_raw(
+        document, json.loads(raw_path.read_text(encoding="utf-8")), source="legacy-cache"
     )
 
 
-async def _obtener_ocr(img: Path, client: Mistral, refresh: bool) -> str:
-    cache = _CACHE_DIR / f"{img.stem}.ocr.txt"
-    if cache.exists() and not refresh:
-        return cache.read_text(encoding="utf-8")
-    b64 = base64.b64encode(img.read_bytes()).decode()
-    texto = await ap._con_reintento(ap._ocr_imagen, b64, client)
-    cache.write_text(texto or "", encoding="utf-8")
-    return texto or ""
+def print_report(rows: list[dict[str, Any]]) -> None:
+    print("EVALUACIÓN DEL CORPUS REAL (extracciones cacheadas, reglas actuales)\n")
+    for row in rows:
+        flags = []
+        if row.get("validation_codes"):
+            flags.append("reglas=" + ",".join(row["validation_codes"]))
+        if row.get("mismatches"):
+            flags.append("campos_ref=" + ",".join(item["field"] for item in row["mismatches"]))
+        detail = "; ".join(flags) or "sin discrepancias deterministas"
+        print(
+            f"{'OK' if row['safe_route'] else 'UNSAFE':6} {row['file']} -> "
+            f"{row['expected_outcome']} ({detail})"
+        )
+    mismatches = sum(len(row.get("mismatches", [])) for row in rows)
+    unsafe = sum(not row["safe_route"] for row in rows)
+    print(f"\nDocumentos: {len(rows)} | discrepancias de referencia: {mismatches} | escapes inseguros: {unsafe}")
+    print("AUTO_CONFIRM_CLEAN está " + ("ACTIVO" if settings.AUTO_CONFIRM_CLEAN else "desactivado"))
 
 
-async def _obtener_llm(img: Path, ocr_text: str, client: Mistral, refresh: bool) -> dict:
-    cache = _CACHE_DIR / f"{img.stem}.raw.json"
-    if cache.exists() and not refresh:
-        return json.loads(cache.read_text(encoding="utf-8"))
-    data = await ap._con_reintento(ap._extraer_datos_llm, ocr_text, client)
-    cache.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return data
-
-
-def _analizar(img_name: str, ocr_text: str, raw: dict) -> dict:
-    """Aplica la lógica determinista y validaciones; devuelve un informe estructurado."""
-    informe: dict = {"imagen": img_name, "errores": [], "lineas": []}
-
-    # OCR vacío / confianza
-    informe["ocr_len"] = len(ocr_text or "")
-    if not ocr_text or not ocr_text.strip():
-        informe["errores"].append({"tipo": "ocr_vacio", "detalle": "OCR no extrajo texto"})
-
-    # blacklist
-    bl = ap._verificar_blacklist(ocr_text or "")
-    if bl:
-        informe["errores"].append({"tipo": "blacklist", "detalle": bl})
-
-    # Validación Pydantic / extracción
-    try:
-        albaran = ap.AlbaranLLM.model_validate(raw)
-    except Exception as e:
-        informe["errores"].append({"tipo": "pydantic", "detalle": str(e)[:300]})
-        return informe
-
-    informe["proveedor"] = albaran.proveedor_nombre
-    informe["nif"] = albaran.proveedor_nif
-    informe["numero"] = albaran.numero_albaran
-    informe["fecha"] = albaran.fecha
-    informe["total"] = albaran.total
-    informe["forma_pago"] = albaran.forma_pago
-
-    # Resolver precio neto determinista
-    for l in albaran.lineas:
-        ap._resolver_precio_neto(l)
-
-    # Validación mínima
-    ok_min, motivo_min = ap._validar_datos_minimos(albaran)
-    if not ok_min:
-        informe["errores"].append({"tipo": "validacion_minima", "detalle": motivo_min})
-
-    # Detección de líneas duplicadas (mismo nombre normalizado lower)
-    nombres = [l.nombre_producto.strip().lower() for l in albaran.lineas]
-    vistos: dict[str, int] = {}
-    for n in nombres:
-        vistos[n] = vistos.get(n, 0) + 1
-    repetidos = {n: c for n, c in vistos.items() if c > 1}
-    informe["nombres_repetidos"] = repetidos  # informativo: NO es error per se
-
-    # Por línea
-    suma_lineas = 0.0
-    lineas_revision = 0
-    for i, l in enumerate(albaran.lineas, 1):
-        ok, motivo = ap._validar_linea(l)
-        suma_lineas += l.importe_neto or 0
-        if not ok or l.confianza < 70:
-            lineas_revision += 1
-        esperado = None
-        if l.precio_unitario and l.cantidad:
-            esperado = round(l.precio_unitario * l.cantidad, 2)
-        informe["lineas"].append({
-            "n": i,
-            "nombre": l.nombre_producto,
-            "cant": l.cantidad,
-            "unidad": l.unidad,
-            "tarifa": l.precio_tarifa,
-            "dto": l.descuento_pct,
-            "neto_col": l.precio_neto,
-            "precio_unit": l.precio_unitario,
-            "importe": l.importe_neto,
-            "esperado": esperado,
-            "conf": l.confianza,
-            "ok": ok,
-            "motivo": motivo,
-        })
-
-    informe["num_lineas"] = len(albaran.lineas)
-    informe["suma_lineas"] = round(suma_lineas, 2)
-    informe["lineas_revision"] = lineas_revision
-
-    # Total cuadra — usa la MISMA reconciliación IVA-aware del pipeline real
-    cuadra, suma = ap._reconciliar_lineas_total(albaran)
-    if albaran.total:
-        informe["total_dif_pct"] = round(abs(suma - albaran.total) / albaran.total * 100, 2)
-    if not cuadra:
-        informe["errores"].append({
-            "tipo": "total_no_cuadra",
-            "detalle": (
-                f"suma={suma:.2f} no cuadra con base={albaran.base_imponible} / "
-                f"total-iva={(albaran.total - albaran.total_iva) if albaran.total and albaran.total_iva else None} / "
-                f"total={albaran.total}"
-            ),
-        })
-
-    return informe
-
-
-async def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--refresh-ocr", action="store_true")
-    parser.add_argument("--refresh-llm", action="store_true")
-    parser.add_argument("--only", default=None, help="subcadena del nombre de imagen")
-    parser.add_argument("--json-out", default=None, help="ruta para volcar informe JSON")
+    parser.add_argument("--only", help="Subcadena del nombre de imagen")
+    parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
-
-    client = Mistral(api_key=settings.MISTRAL_API_KEY)
-    imagenes = _listar_imagenes()
-    if args.only:
-        imagenes = [p for p in imagenes if args.only.lower() in p.name.lower()]
-
-    informes = []
-    for img in imagenes:
-        try:
-            ocr = await _obtener_ocr(img, client, args.refresh_ocr)
-            raw = await _obtener_llm(img, ocr, client, args.refresh_ocr or args.refresh_llm)
-            informe = _analizar(img.name, ocr, raw)
-        except Exception as e:
-            informe = {"imagen": img.name, "errores": [{"tipo": "excepcion", "detalle": str(e)[:300]}], "lineas": []}
-        informes.append(informe)
-        _imprimir(informe)
-
+    rows = [evaluate(document) for document in _load_documents(args.only)]
+    print_report(rows)
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(informes, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    _resumen(informes)
-
-
-def _imprimir(inf: dict) -> None:
-    print("\n" + "=" * 78)
-    print(f"📄 {inf['imagen']}")
-    if "proveedor" in inf:
-        print(f"   Proveedor: {inf.get('proveedor')!r}  NIF: {inf.get('nif')}")
-        print(f"   Nº: {inf.get('numero')}  Fecha: {inf.get('fecha')}  Total: {inf.get('total')}  Pago: {inf.get('forma_pago')}")
-        print(f"   Líneas: {inf.get('num_lineas')}  Suma líneas: {inf.get('suma_lineas')}  "
-              f"Dif total: {inf.get('total_dif_pct', '—')}%  Revisión: {inf.get('lineas_revision')}")
-        if inf.get("nombres_repetidos"):
-            print(f"   ⚠ Nombres repetidos (¿líneas físicas distintas?): {inf['nombres_repetidos']}")
-        for l in inf["lineas"]:
-            flag = "✓" if l["ok"] and l["conf"] >= 70 else "✗"
-            print(f"     {flag} {l['n']:>2}. {l['nombre'][:34]:<34} "
-                  f"cant={_f(l['cant'])} {l['unidad'] or '?':<4} "
-                  f"tar={_f(l['tarifa'])} dto={_f(l['dto'])} netoCol={_f(l['neto_col'])} "
-                  f"→ PU={_f(l['precio_unit'])} imp={_f(l['importe'])} (esp={_f(l['esperado'])}) c={l['conf']}")
-            if not l["ok"]:
-                print(f"          ↳ {l['motivo']}")
-    if inf["errores"]:
-        print("   ❌ ERRORES:")
-        for e in inf["errores"]:
-            print(f"      - [{e['tipo']}] {e['detalle']}")
-
-
-def _f(v) -> str:
-    if v is None:
-        return "—"
-    if isinstance(v, float):
-        return f"{v:g}"
-    return str(v)
-
-
-def _resumen(informes: list[dict]) -> None:
-    print("\n" + "#" * 78)
-    print("RESUMEN GLOBAL")
-    print("#" * 78)
-    n = len(informes)
-    con_error = [i for i in informes if i["errores"]]
-    print(f"Albaranes: {n}  |  Con errores: {len(con_error)}  |  Limpios: {n - len(con_error)}")
-    # Conteo por tipo
-    tipos: dict[str, int] = {}
-    for inf in informes:
-        for e in inf["errores"]:
-            tipos[e["tipo"]] = tipos.get(e["tipo"], 0) + 1
-    if tipos:
-        print("Errores por tipo:")
-        for t, c in sorted(tipos.items(), key=lambda x: -x[1]):
-            print(f"   {c:>3}  {t}")
-    # líneas totales y con problema
-    total_lineas = sum(i.get("num_lineas", 0) for i in informes)
-    lineas_mal = sum(1 for i in informes for l in i.get("lineas", []) if not l["ok"])
-    print(f"Líneas totales: {total_lineas}  |  Líneas que fallan validación: {lineas_mal}")
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 1 if any(not row["safe_route"] for row in rows) else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(main())

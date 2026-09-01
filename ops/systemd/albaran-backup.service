@@ -1,0 +1,19 @@
+[Unit]
+Description=Backup verificado de Albaran Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=albaran-backup
+Group=albaran-backup
+WorkingDirectory=/opt/albaran-bot
+EnvironmentFile=/etc/albaran-bot/backup.env
+UMask=0077
+ExecStart=/opt/albaran-bot/scripts/backup_database.sh --output-dir /var/backups/albaran-bot
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/albaran-bot
+

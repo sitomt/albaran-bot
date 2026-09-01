@@ -1,34 +1,20 @@
-"""
-Pipeline completo de procesamiento de albaranes:
-OCR (Mistral) → extracción estructurada (LLM) → validación → guardado en Supabase.
-"""
+"""Modelos, prompt y reglas deterministas compartidas por la ingesta actual."""
 from __future__ import annotations
 
-import asyncio
-import base64
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
-from datetime import date as _date
 from datetime import datetime
 from typing import Any
 
-from mistralai.client.sdk import Mistral
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
 
 from .config import settings
-from . import supabase_client as db
-from .product_normalizer import normalizar_productos_batch, invalidar_cache_proveedor
 
 logger = logging.getLogger(__name__)
 
-_MODELO_OCR = "mistral-ocr-latest"
-_MODELO_LLM = "mistral-small-2506"
-
-# Coste estimado por token (USD) — mistral-small-2506
-_COSTE_INPUT_POR_TOKEN = 0.0000002
-_COSTE_OUTPUT_POR_TOKEN = 0.0000006
+_MODELO_OCR = settings.OCR_MODEL
+_MODELO_LLM = settings.EXTRACTION_MODEL
 
 _BLACKLIST = [
     "nómina", "nomina", "salario", "sueldo bruto",
@@ -51,30 +37,29 @@ def _verificar_blacklist(texto: str) -> str | None:
     return None
 
 
-def _validar_datos_minimos(albaran: "AlbaranLLM") -> tuple[bool, str]:
-    if not albaran.proveedor_nombre or not albaran.proveedor_nombre.strip():
-        return False, "nombre de proveedor vacío"
-    try:
-        fecha = _date.fromisoformat(albaran.fecha)
-        if fecha > _date.today():
-            return False, f"fecha futura ({albaran.fecha})"
-    except Exception:
-        return False, f"fecha inválida ({albaran.fecha})"
-    if not albaran.lineas:
-        return False, "sin líneas de productos"
-    if albaran.total is not None and albaran.total <= 0:
-        return False, f"total inválido ({albaran.total})"
-    if not any(l.precio_unitario and l.precio_unitario > 0 for l in albaran.lineas):
-        return False, "ninguna línea con precio válido"
-    return True, ""
+def _normalizar_fecha(v: str | None) -> str | None:
+    """Convierte cualquier formato de fecha reconocido a ISO (YYYY-MM-DD).
+
+    Sin esto, cadenas como '26/08/2026' llegan tal cual a Postgres, que las
+    interpreta como MM/DD/YYYY por defecto: mes=26 no existe → error 22008
+    ("date/time field value out of range") y el confirm entero falla.
+    """
+    if not v:
+        return None
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(str(v).strip(), fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
 # ── Modelos de datos ──────────────────────────────────────────────────────────
 
 class LineaAlbaranLLM(BaseModel):
-    nombre_producto: str
+    nombre_producto: str | None = None
     descripcion_original: str | None = None
-    cantidad: float
+    cantidad: float | None = None
     unidad: str | None = None
     precio_unitario: float | None = None
     precio_tarifa: float | None = None   # columna TARIFA / precio de lista (bruto), transitorio
@@ -82,13 +67,14 @@ class LineaAlbaranLLM(BaseModel):
     importe_neto: float | None = None
     peso_unitario_g: float | None = None
     unidades_por_envase: int | None = None
+    bultos: float | None = None
     peso_total_kg: float | None = None
     volumen_unitario_l: float | None = None
     formato_envase: str | None = None
     numero_lote: str | None = None
     caducidad: str | None = None
     descuento_pct: float | None = None
-    confianza: int = 100
+    confianza: int = 0
 
     @field_validator("confianza", mode="before")
     @classmethod
@@ -97,17 +83,18 @@ class LineaAlbaranLLM(BaseModel):
             n = int(float(str(v)))
             return max(0, min(100, n))
         except Exception:
-            return 100
+            # Confianza ausente/inválida nunca debe convertirse en certeza.
+            return 0
 
     @field_validator("cantidad", mode="before")
     @classmethod
-    def cantidad_positiva(cls, v: Any) -> float:
+    def cantidad_positiva(cls, v: Any) -> float | None:
         v = _parsear_numero(v)
-        if v is None or v <= 0:
-            raise ValueError("cantidad debe ser > 0")
+        if v is not None and v <= 0:
+            return None
         return v
 
-    @field_validator("precio_unitario", "precio_tarifa", "precio_neto", "importe_neto", "peso_unitario_g", "peso_total_kg", "volumen_unitario_l", "descuento_pct", mode="before")
+    @field_validator("precio_unitario", "precio_tarifa", "precio_neto", "importe_neto", "peso_unitario_g", "peso_total_kg", "volumen_unitario_l", "descuento_pct", "bultos", mode="before")
     @classmethod
     def limpiar_numerico(cls, v: Any) -> float | None:
         return _parsear_numero(v)
@@ -118,21 +105,26 @@ class LineaAlbaranLLM(BaseModel):
         n = _parsear_numero(v)
         return int(n) if n is not None else None
 
+    @field_validator("caducidad", mode="before")
+    @classmethod
+    def normalizar_caducidad(cls, v: str | None) -> str | None:
+        return _normalizar_fecha(v)
+
 
 class DetalleIvaLLM(BaseModel):
-    tipo: float
-    base: float
-    cuota: float
+    tipo: float | None = None
+    base: float | None = None
+    cuota: float | None = None
 
 
 class AlbaranLLM(BaseModel):
-    proveedor_nombre: str
+    proveedor_nombre: str | None = None
     proveedor_nif: str | None = None
     proveedor_direccion: str | None = None
     proveedor_telefono: str | None = None
     proveedor_email: str | None = None
     numero_albaran: str | None = None
-    fecha: str
+    fecha: str | None = None
     forma_pago: str | None = None
     base_imponible: float | None = None
     total_iva: float | None = None
@@ -142,48 +134,13 @@ class AlbaranLLM(BaseModel):
 
     @field_validator("fecha", mode="before")
     @classmethod
-    def normalizar_fecha(cls, v: str) -> str:
-        if not v:
-            return datetime.now().strftime("%Y-%m-%d")
-        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"):
-            try:
-                return datetime.strptime(str(v).strip(), fmt).strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-        logger.warning("Fecha no reconocida: %s — usando fecha actual", v)
-        return datetime.now().strftime("%Y-%m-%d")
+    def normalizar_fecha(cls, v: str | None) -> str | None:
+        return _normalizar_fecha(v)
 
     @field_validator("base_imponible", "total_iva", "total", mode="before")
     @classmethod
     def limpiar_importe(cls, v: Any) -> float | None:
         return _parsear_numero(v)
-
-    @model_validator(mode="after")
-    def proveedor_nombre_no_vacio(self) -> "AlbaranLLM":
-        if not self.proveedor_nombre or not self.proveedor_nombre.strip():
-            raise ValueError("proveedor_nombre no puede estar vacío")
-        return self
-
-
-class ResultadoProcesamiento(BaseModel):
-    albaran_id: str
-    proveedor_id: str
-    proveedor_nombre: str
-    numero_albaran: str | None
-    fecha: str
-    forma_pago: str | None
-    total: float | None
-    num_lineas: int
-    es_proveedor_nuevo: bool
-    es_duplicado: bool
-    es_duplicado_fecha: str | None = None      # creado_en del registro original (ISO)
-    es_duplicado_numero_original: str | None = None  # numero_albaran del registro original
-    lineas_con_revision: int
-    alertas_precio: list[dict]  # [{"producto": str, "anterior": float, "nuevo": float, "pct": float}]
-    imagen_url: str | None
-    lineas_para_confirmacion: list[dict] = []
-    # cada dict: {"num": int, "linea_id": str, "descripcion": str, "cantidad": float, "precio": float|None, "unidad": str|None, "razon": str}
-
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
 
@@ -217,20 +174,6 @@ def _parsear_numero(v: Any) -> float | None:
         except ValueError:
             return None
     return None
-
-
-async def _con_reintento(func: Callable, *args: Any, max_intentos: int = 3, **kwargs: Any) -> Any:
-    ultimo_error: Exception | None = None
-    for i in range(max_intentos):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            ultimo_error = e
-            if i < max_intentos - 1:
-                espera = 2 ** i
-                logger.warning("Intento %d/%d fallido: %s — reintentando en %ds", i + 1, max_intentos, e, espera)
-                await asyncio.sleep(espera)
-    raise ultimo_error
 
 
 # ── Resolución determinista del precio neto ─────────────────────────────────────
@@ -337,38 +280,6 @@ def _alinear_cantidad_unidad(linea: "LineaAlbaranLLM") -> None:
 
 # ── Validación de línea ───────────────────────────────────────────────────────
 
-def _reconciliar_lineas_total(albaran: "AlbaranLLM") -> tuple[bool, float]:
-    """
-    Comprueba si la suma de importes netos de línea (= base imponible) cuadra con el
-    documento, TOLERANDO el IVA. La suma de líneas es SIN IVA, mientras que `total` lo
-    incluye; comparar directamente daba falsos positivos masivos.
-
-    Acepta si la suma cuadra (±5%) con CUALQUIERA de los objetivos plausibles:
-      - base_imponible (cuando el LLM lo leyó bien),
-      - total - total_iva,
-      - total (albaranes sin IVA).
-    Devuelve (cuadra, suma_lineas).
-    """
-    suma = round(sum(l.importe_neto or 0 for l in albaran.lineas), 2)
-    if suma <= 0:
-        return True, suma  # sin importes que comparar (p.ej. manuscrito sin importes)
-
-    # Sin TOTAL impreso no reconciliamos: base_imponible sola es señal débil (el LLM la
-    # inventa/lee mal en albaranes internos sin pie de totales). Las líneas ya se validan
-    # una a una en _validar_linea, así que un error real de línea se detecta igual.
-    if not albaran.total or albaran.total <= 0:
-        return True, suma
-
-    objetivos: list[float] = [albaran.total]
-    if albaran.total_iva:
-        objetivos.append(albaran.total - albaran.total_iva)
-    if albaran.base_imponible and albaran.base_imponible > 0:
-        objetivos.append(albaran.base_imponible)
-
-    mejor = min(abs(suma - o) / o for o in objetivos if o > 0)
-    return mejor <= 0.05, suma
-
-
 def _validar_linea(linea: "LineaAlbaranLLM") -> tuple[bool, str]:
     """Retorna (ok, motivo). Si ok=False, la línea necesita revisión."""
     if linea.precio_unitario is not None and linea.precio_unitario <= 0:
@@ -419,6 +330,7 @@ Extrae TODOS los datos del albarán y devuelve JSON con esta estructura exacta:
       "nombre_producto": "nombre del producto",
       "descripcion_original": "descripción completa tal como aparece",
       "cantidad": número,
+      "bultos": número de piezas/cajas de la columna UDS si además existe una columna KG/KGRS o null,
       "unidad": "kg" | "ud" | "l" | "caja" según corresponda,
       "precio_tarifa": precio de la columna TARIFA / precio de lista (bruto, antes de descuento) o null,
       "precio_neto": precio de la columna NETO / PRECIO FINAL si aparece explícita en el albarán, o null si no existe esa columna,
@@ -446,6 +358,13 @@ Ejemplo: "IVA 10% 307,53€ = 30,75€" y "IVA 4% 30,87€ = 1,23€" →
 Si solo hay un tipo, igual extráelo: [{"tipo": 10, "base": 307.53, "cuota": 30.75}]
 Si no aparece desglose de IVA, pon detalle_iva: null.
 
+REGLA CRÍTICA — NÚMERO DEL DOCUMENTO:
+`numero_albaran` es exclusivamente el valor etiquetado como ALBARÁN / Nº ALBARÁN.
+Si no existe pero el documento es una factura, usa Nº FACTURA. Si aparecen ambos,
+prefiere el Nº ALBARÁN. Nunca uses Nº R.S./registro sanitario, R.P.P., código de
+cliente, pedido, ruta, cuenta, lote o teléfono. Ejemplo: "Nº RS 40.20059/MU",
+"Nº FACTURA 26/2.968" y dentro de la tabla "ALBARÁN 3.950" → devuelve "3.950".
+
 REGLA CRÍTICA — PRECIOS POR COLUMNA (MUY IMPORTANTE):
 NO decidas ni calcules el precio neto. Tu trabajo es SOLO TRANSCRIBIR cada columna a su campo:
   - columna TARIFA / precio de lista / precio bruto  → precio_tarifa
@@ -467,20 +386,77 @@ Si solo hay un precio y ningún descuento:
 
 NUNCA inventes una columna NETO si no aparece: en ese caso precio_neto debe ser null.
 
-REGLA CRÍTICA — COLUMNAS DE PESO (KGRS / KG / KILOS / PESO):
-Si el albarán tiene una columna llamada KGRS, KG, KILOS, PESO o similar:
-  - Ese valor es el peso real de la línea.
-  - Pon ese valor en AMBOS campos: cantidad Y peso_total_kg.
-  - Pon unidad = "kg".
-  Ejemplo: columna KGRS = 12.000 → cantidad: 12.0, peso_total_kg: 12.0, unidad: "kg"
+REGLA CRÍTICA — DE DÓNDE SALEN `cantidad` Y `unidad` (LA REGLA MÁS IMPORTANTE):
 
-REGLA CRÍTICA — INFERENCIA DE UNIDAD DESDE DESCRIPCIÓN:
-Analiza el nombre del producto y las unidades indicadas. NO uses siempre "ud":
-  - unidad = "kg": carnes, pescados, embutidos, quesos a granel, verduras, frutas,
-    aceites a granel, legumbres a granel, harina a granel. Cualquier alimento por peso.
-  - unidad = "ud": latas, botes, cajas, paquetes, bolsas con peso fijo, botellas contables.
-  - unidad = "l": líquidos vendidos en litros. Si la descripción contiene "L", "litros",
-    "garrafa Xl", extrae volumen_unitario_l.
+La unidad la decide la ESTRUCTURA del albarán (qué columna trae el número),
+NUNCA el tipo de alimento ni el texto del nombre del producto.
+La medida base por defecto son UNIDADES; los kilos hay que demostrarlos.
+
+Aplica este procedimiento a CADA línea, en este orden exacto:
+
+PASO 1 — ¿Existe una columna de peso propia (KGRS, KG, KILOS, PESO, Ud/Kg, NETO KG)
+         y trae VALOR en ESTA línea concreta?
+   SÍ → la línea se factura por peso:
+        cantidad = ese peso, unidad = "kg", peso_total_kg = ese mismo peso.
+        Si además hay columna UDS/CAJAS/BULTOS, esa cifra va en `bultos`,
+        NUNCA en `cantidad`.
+   NO → pasa al PASO 2.
+        Una columna de peso que EXISTE pero está VACÍA en esta línea cuenta como NO.
+        Una celda vacía significa "esta línea no se vende por peso": jamás rellenes
+        el peso copiando el número de la columna de unidades ni de ninguna otra.
+
+PASO 2 — Mira la cifra de la columna de cantidad (UNID., CDAD, CANTIDAD, CTD, UDS).
+         ¿Es un decimal de báscula, es decir, tiene decimales que solo salen de pesar
+         (p.ej. 1,557 / 5,74 / 18,60 / 25,26 / 2,39)?
+   SÍ → la línea se factura por peso aunque no haya columna de peso:
+        cantidad = esa cifra, unidad = "kg", peso_total_kg = esa cifra.
+   NO → la línea se factura por UNIDADES (lo normal):
+        cantidad = esa cifra tal cual, unidad = "ud", peso_total_kg = null.
+
+POR DEFECTO, ANTE LA DUDA: unidad = "ud" y peso_total_kg = null.
+Es mucho peor inventar kilos que el albarán no dice que contar unidades.
+
+PROHIBIDO deducir la unidad del TIPO de producto. Que sea carne, pescado, queso,
+embutido, aceituna, verdura o fruta NO significa que se venda a granel: esos mismos
+alimentos se venden a diario en tarrinas, bolsas, botes, cubos y bandejas cerradas.
+Solo el PASO 1 (columna de peso con valor) o el PASO 2 (decimal de báscula)
+autorizan unidad = "kg". Si ninguno se cumple, es "ud" aunque el producto sea fresco.
+
+PROHIBIDO usar un peso o volumen que aparezca PEGADO AL NOMBRE del producto como
+`cantidad`, como `peso_total_kg`, o como excusa para poner unidad = "kg".
+Un peso/volumen dentro del nombre describe SIEMPRE el tamaño de CADA envase.
+Va en peso_unitario_g / volumen_unitario_l, con unidad = "ud". Da igual que la
+cantidad sea 1 o 20, y da igual cuál sea el alimento.
+
+Comprobación final antes de responder: para cada línea verifica qué cifra cumple
+PRECIO NETO × CANTIDAD ≈ IMPORTE. Úsala solo para elegir entre la columna de
+unidades y la de peso; no cambies ni inventes ningún valor observado.
+
+REGLA — VOLUMEN EN LÍQUIDOS:
+  - unidad = "l" solo si el albarán factura litros sueltos (a granel).
+  - Un líquido en envases contables (briks, botellas, garrafas, latas) es unidad = "ud",
+    y su capacidad va en volumen_unitario_l.
+
+REGLA CRÍTICA — PESO PEGADO AL NOMBRE = PESO POR UNIDAD, NUNCA PESO TOTAL (MUY IMPORTANTE):
+Si un número de peso (kg/g) aparece pegado al nombre del producto (p.ej. "Ensaladilla
+Rusa Premium 2.3 Kg", "Queso Cremette cubo 3.5kg", "Rosquilla casera 2Kg") Y NO hay una
+columna KGRS/KG/KILOS/PESO separada con el peso real de la línea:
+  - Ese número es el peso de CADA envase/tarrina/cubo, NUNCA el peso total de la línea.
+  - Va SIEMPRE en peso_unitario_g (convertido a gramos), NUNCA en peso_total_kg.
+  - unidad = "ud" (se compran por tarrinas/cubos, no a granel), aunque el nombre
+    contenga "Kg".
+  - cantidad = número de envases/tarrinas (columna UDS o cantidad tal cual), SIN
+    multiplicar ni dividir por el peso — esto vale igual si cantidad es 1 o mayor.
+  Esto es el PASO 2 de la regla de cantidad/unidad aplicado al nombre: aunque el
+  producto sea un alimento que a veces se vende a granel (p.ej. ensaladilla, queso,
+  aceitunas, anchoas), si el peso aparece pegado al nombre en vez de en una columna
+  propia CON VALOR, es tamaño de envase, no venta a granel.
+  Ejemplo con cantidad=1: "Queso Cremette cubo 3.5kg" →
+    cantidad: 1.0, unidad: "ud", peso_unitario_g: 3500
+  Ejemplo con cantidad=2 (mismo patrón, NO lo conviertas en peso a granel):
+    "Ensaladilla Rusa Premium 2.3 Kg" con columna cantidad=2 →
+    cantidad: 2.0, unidad: "ud", peso_unitario_g: 2300, peso_total_kg: null
+    (NUNCA cantidad: 2.3, ni unidad: "kg", ni peso_total_kg: 2)
 
 REGLA CRÍTICA — EXTRACCIÓN DE VOLUMEN PARA LÍQUIDOS:
 Si la descripción contiene un volumen (ej: "25L", "5 litros", "garrafa 25L"):
@@ -505,6 +481,9 @@ Ejemplo: cabecera "Embutidos García S.L. CIF B12345678" | pie "Cliente: Bar Los
   → proveedor_nombre: "Embutidos García S.L.", proveedor_nif: "B12345678"  (NO "B87654321")
 Ejemplo: albarán sin CIF del proveedor visible, solo aparece el CIF del cliente en el pie
   → proveedor_nif: null
+Si aparece un NIF junto a la tabla de cliente y otro junto al nombre/contacto del
+emisor (incluso en el pie), el segundo es el proveedor. Nunca copies el NIF de
+HERBAHER HOSTELERIA/RESTAURANTE VENTA ALEGRIA como NIF del proveedor.
 
 REGLAS ADICIONALES:
 - Nunca inventes datos. Si un campo no aparece, usa null.
@@ -513,7 +492,9 @@ REGLAS ADICIONALES:
   Mal: "Bocata gran reserva 150g (50 unid)" → Bien: "Bocata Gran Reserva"
 - peso_unitario_g: extrae de "150g", "200gr" en la descripción.
 - unidades_por_envase: extrae de "(50 unid)", "(12 pcs)", "x50".
-- peso_total_kg: si unidad=kg, repite el valor de cantidad aquí también.
+- peso_total_kg: rellénalo SOLO cuando la unidad sea "kg" por el PASO 1 o el PASO 2
+  (entonces repite ahí el valor de cantidad). Si la unidad es "ud", va null: el peso
+  de cada envase se guarda en peso_unitario_g, no aquí.
 - Los importes pueden usar coma o punto decimal. Elimina €.
 
 CAMPO CONFIANZA POR LÍNEA:
@@ -543,15 +524,35 @@ EJEMPLOS COMPLETOS:
     nombre_producto: "Aceite Alto Oleico F40% Frimasol"
     cantidad: 1.0, unidad: "l", volumen_unitario_l: 25, formato_envase: "garrafa"
 
-  "Tomate entero" columna KGRS=12.000 →
+  "Tomate entero" columna KGRS=12.000 (columna de peso CON valor → PASO 1) →
     cantidad: 12.0, peso_total_kg: 12.0, unidad: "kg"
 
-  "Anchoas cantábricas" columna KGRS=25.26 →
+  "Anchoas cantábricas" columna KGRS=25.26 (PASO 1) →
     cantidad: 25.26, peso_total_kg: 25.26, unidad: "kg"
+
+  MISMO producto, columna de peso VACÍA — el caso que más se falla:
+  "Tomate entero 1kg .exito." con UNID.=12,000 y la columna KGRS en blanco →
+    nombre_producto: "Tomate Entero Éxito"
+    cantidad: 12.0, unidad: "ud", peso_unitario_g: 1000, peso_total_kg: null
+    (son 12 envases de 1 kg; NUNCA unidad "kg" solo porque el tomate sea verdura)
+
+  "Aceitunas partidas cubo 2.5 kg" con UNID.=4,000 y columna KGRS en blanco →
+    nombre_producto: "Aceitunas Partidas Cubo"
+    cantidad: 4.0, unidad: "ud", peso_unitario_g: 2500, peso_total_kg: null
+    (4 cubos, NO 4 kg: el 2.5 kg es lo que pesa cada cubo)
+
+  "Anchoas cantabrico Noemar" con UNID.=3,000 y columna KGRS en blanco →
+    cantidad: 3.0, unidad: "ud", peso_total_kg: null
+    (la celda de peso vacía manda: son 3 envases, aunque sea pescado)
 
   "Queso Cremette cubo 3.5kg" →
     nombre_producto: "Queso Cremette Cubo"
     cantidad: 1.0, unidad: "ud", peso_unitario_g: 3500
+
+  "Ensaladilla Rusa Premium 2.3 Kg" con columna cantidad=2 (peso pegado al nombre,
+  SIN columna KGRS propia — es el peso de cada tarrina, no de toda la línea) →
+    nombre_producto: "Ensaladilla Rusa Premium"
+    cantidad: 2.0, unidad: "ud", peso_unitario_g: 2300, peso_total_kg: null
 
   "Bocata gran reserva 150g (50 unid)" →
     nombre_producto: "Bocata Gran Reserva"
@@ -561,62 +562,13 @@ EJEMPLOS COMPLETOS:
     nombre_producto: "Garbanzos Cocidos Miau"
     cantidad: 6.0, unidad: "ud", peso_unitario_g: 3000, formato_envase: "lata"
 
-  "Harina de freír" 10 kg saco →
+  "Harina de freír Miau" con UNID.=10,000 y la columna KGRS en blanco →
+    cantidad: 10.0, unidad: "ud", peso_total_kg: null
+    (son 10 sacos; sin peso en su columna NO se puede afirmar que sean 10 kg)
+
+  "Harina de freír" en un albarán cuya columna KGRS marca 10,000 para esa línea →
     cantidad: 10.0, peso_total_kg: 10.0, unidad: "kg"
 """
-
-
-async def _ocr_imagen(imagen_base64: str, client: Mistral) -> str:
-    response = await asyncio.wait_for(
-        client.ocr.process_async(
-            model=_MODELO_OCR,
-            document={
-                "type": "image_url",
-                "image_url": f"data:image/jpeg;base64,{imagen_base64}",
-            },
-        ),
-        timeout=60,
-    )
-    paginas = response.pages or []
-    return "\n\n".join(p.markdown for p in paginas if p.markdown)
-
-
-async def _clasificar_documento(imagen_b64: str, client: Mistral) -> dict:
-    """
-    Clasifica el documento en un tipo cerrado.
-    Retorna {'tipo': str, 'motivo': str, 'confianza': int}.
-    Solo 'albaran_proveedor' con confianza >= 75 pasa al pipeline.
-    """
-    prompt_clasificacion = (
-        "Mira esta imagen. ¿Es claramente una nómina, un recibo de luz/gas/agua/alquiler/seguro, "
-        "o un ticket de caja de supermercado?\n\n"
-        "Responde SOLO en JSON: "
-        '{"rechazar": true o false, "motivo": "explicación breve en español", "confianza": número entre 0 y 100}\n\n'
-        "rechazar=true SOLO si estás completamente seguro de que es uno de esos documentos. "
-        "Si hay cualquier duda, o si parece un documento de proveedor/distribuidor, responde rechazar=false."
-    )
-    response = await client.chat.complete_async(
-        model=_MODELO_LLM,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{imagen_b64}"}},
-                {"type": "text", "text": prompt_clasificacion},
-            ],
-        }],
-        response_format={"type": "json_object"},
-        max_tokens=120,
-        temperature=0.1,
-    )
-    data = json.loads(response.choices[0].message.content)
-    rechazar = data.get("rechazar", False)
-    confianza = int(data.get("confianza", 0))
-    return {
-        "es_albaran": not rechazar,
-        "tipo": "rechazado" if rechazar else "albaran_proveedor",
-        "confianza": confianza,
-        "motivo": data.get("motivo", ""),
-    }
 
 
 def _escapar_control(content: str) -> str:
@@ -705,404 +657,25 @@ def _parse_json_robusto(content: str) -> dict:
       3. Recuperando líneas completas si la respuesta llegó truncada (max_tokens).
     """
     try:
-        return json.loads(content)
+        result = json.loads(content)
+        result["_extraction_complete"] = True
+        return result
     except json.JSONDecodeError:
         pass
 
     escaped = _escapar_control(content)
     try:
-        return json.loads(escaped)
+        result = json.loads(escaped)
+        result["_extraction_complete"] = True
+        return result
     except json.JSONDecodeError:
         pass
 
     recuperado = _recuperar_lineas_truncadas(escaped)
     if recuperado is not None:
         logger.warning("JSON del LLM truncado/dañado — recuperadas %d líneas completas", len(recuperado.get("lineas", [])))
+        recuperado["_extraction_complete"] = False
         return recuperado
 
     # Sin recuperación posible: relanzar el error original para que el pipeline lo gestione.
     return json.loads(escaped)
-
-
-async def _extraer_datos_llm(ocr_text: str, client: Mistral) -> dict:
-    response = await asyncio.wait_for(
-        client.chat.complete_async(
-            model=_MODELO_LLM,
-            messages=[
-                {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Texto del albarán:\n\n{ocr_text}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=8192,
-        ),
-        timeout=60,
-    )
-    return _parse_json_robusto(response.choices[0].message.content)
-
-
-# ── Pipeline principal ────────────────────────────────────────────────────────
-
-async def procesar_albaran(
-    job_id: str,
-    imagen_bytes: bytes,
-    chat_id: int,
-    progress_callback: Callable[[str], Awaitable[None]],
-    imagen_hash: str | None = None,
-) -> ResultadoProcesamiento:
-    """
-    Pipeline completo. Actualiza el job en cada etapa.
-    Lanza AlbaranProcessingError si algo falla de forma irrecuperable.
-    """
-    mistral = Mistral(api_key=settings.MISTRAL_API_KEY)
-    tokens_totales = 0
-    imagen_url: str | None = None
-
-    try:
-        # a) OCR — la imagen NO se sube a Storage todavía. Solo se subirá si el albarán
-        # se guarda con éxito (no duplicado, legible, válido), para no dejar huérfanas.
-        await db.actualizar_job(job_id, estado="procesando")
-        imagen_b64 = base64.b64encode(imagen_bytes).decode()
-        await progress_callback("Leyendo imagen...")
-
-        ocr_text = await _con_reintento(_ocr_imagen, imagen_b64, mistral)
-
-        if not ocr_text or not ocr_text.strip():
-            raise ValueError("El OCR no extrajo texto del documento. Verifica que la imagen sea legible.")
-
-        # c2) Blacklist: rechazar documentos claramente no válidos sin llamar al LLM de extracción
-        palabra_prohibida = _verificar_blacklist(ocr_text)
-        if palabra_prohibida:
-            logger.info("Documento rechazado por blacklist: '%s'", palabra_prohibida)
-            raise ValueError(
-                "Este documento no es un albarán de compra de proveedor y no se registrará.\n"
-                f"Tipo de documento detectado: '{palabra_prohibida}'."
-            )
-
-        # d) Extracción LLM
-        await progress_callback("Extrayendo datos estructurados...")
-        raw_data = await _con_reintento(_extraer_datos_llm, ocr_text, mistral)
-        albaran_data = AlbaranLLM.model_validate(raw_data)
-
-        # d1) Resolver precio NETO de forma determinista (el neto prevalece SIEMPRE)
-        for linea in albaran_data.lineas:
-            _resolver_precio_neto(linea)
-
-        # d2) Validación mínima del JSON extraído
-        ok_minimo, motivo_minimo = _validar_datos_minimos(albaran_data)
-        if not ok_minimo:
-            logger.warning("Validación mínima fallida: %s", motivo_minimo)
-            raise ValueError(
-                "No pude extraer los datos correctamente de este albarán. "
-                "Comprueba que la foto sea nítida y el documento esté completo.\n"
-                f"(Detalle: {motivo_minimo})"
-            )
-
-        # e) Validar suma de líneas vs total (TOLERANDO el IVA: la suma de líneas es la base)
-        lineas_con_revision = 0
-        if albaran_data.lineas:
-            total_cuadra, suma_lineas = _reconciliar_lineas_total(albaran_data)
-            if not total_cuadra:
-                logger.warning(
-                    "Discrepancia total: suma líneas=%.2f no cuadra con base/total del albarán Nº %s",
-                    suma_lineas, albaran_data.numero_albaran,
-                )
-                lineas_con_revision += 1
-            elif suma_lineas > 0 and (
-                albaran_data.base_imponible is None
-                or abs(albaran_data.base_imponible - suma_lineas) / suma_lineas > 0.02
-            ):
-                # Líneas verificadas (cuadran con el documento) pero base_imponible del LLM
-                # incoherente con ellas (mal leída o alucinada). La base imponible ES, por
-                # definición, la suma de los importes netos de línea → la corregimos para que
-                # la BD sea coherente con los datos reales del albarán.
-                base_en_conflicto = albaran_data.base_imponible is not None
-                logger.info(
-                    "base_imponible corregida de %s a %.2f (= suma de líneas) en albarán Nº %s",
-                    albaran_data.base_imponible, suma_lineas, albaran_data.numero_albaran,
-                )
-                albaran_data.base_imponible = suma_lineas
-                # Si el LLM dio una base en conflicto y NO hay total para verificar la
-                # completitud de las líneas, marcamos revisión en vez de corregir en silencio.
-                if base_en_conflicto and albaran_data.total is None:
-                    lineas_con_revision += 1
-
-        # f) Proveedor — el primero que entra manda; nunca se modifica el NIF almacenado
-        await progress_callback("Buscando proveedor...")
-        proveedor, es_proveedor_nuevo = await db.buscar_o_crear_proveedor(
-            nombre=albaran_data.proveedor_nombre,
-            nif=albaran_data.proveedor_nif,
-            direccion=albaran_data.proveedor_direccion,
-            telefono=albaran_data.proveedor_telefono,
-            email=albaran_data.proveedor_email,
-            forma_pago_habitual=albaran_data.forma_pago,
-        )
-
-        # g) Detectar duplicado (3 capas en paralelo antes del insert)
-        numero_norm = _normalizar_numero_albaran(albaran_data.numero_albaran or "")
-
-        checks_dup: list = []
-        if albaran_data.total is not None:
-            # Capa 1: proveedor_id + fecha + total (±0.50€)
-            checks_dup.append(db.buscar_albaran_duplicado_combinacion(
-                proveedor["id"], albaran_data.fecha, albaran_data.total
-            ))
-            # Capa 2: nombre proveedor + fecha + total — cubre NIF mal leído
-            checks_dup.append(db.buscar_albaran_duplicado_por_nombre_proveedor(
-                albaran_data.proveedor_nombre, albaran_data.fecha, albaran_data.total
-            ))
-        if numero_norm:
-            # Capa 3: número normalizado
-            checks_dup.append(db.buscar_albaran_duplicado_norm(numero_norm, proveedor["id"]))
-
-        resultados_dup = await asyncio.gather(*checks_dup, return_exceptions=True) if checks_dup else []
-        duplicado = next(
-            (r for r in resultados_dup if isinstance(r, dict) and r is not None),
-            None,
-        )
-
-        if duplicado:
-            await db.actualizar_job(job_id, estado="completado")
-            return ResultadoProcesamiento(
-                albaran_id=duplicado["id"],
-                proveedor_id=proveedor["id"],
-                proveedor_nombre=proveedor["nombre"],
-                numero_albaran=albaran_data.numero_albaran,
-                fecha=albaran_data.fecha,
-                forma_pago=albaran_data.forma_pago,
-                total=albaran_data.total,
-                num_lineas=len(albaran_data.lineas),
-                es_proveedor_nuevo=False,
-                es_duplicado=True,
-                es_duplicado_fecha=duplicado.get("creado_en"),
-                es_duplicado_numero_original=duplicado.get("numero_albaran"),
-                lineas_con_revision=0,
-                alertas_precio=[],
-                imagen_url=imagen_url,
-                lineas_para_confirmacion=[],
-            )
-
-        # h-i) Insertar albarán
-        await progress_callback("Guardando albarán...")
-        detalle_iva_dicts = (
-            [d.model_dump() for d in albaran_data.detalle_iva]
-            if albaran_data.detalle_iva else None
-        )
-        try:
-            albaran_row = await db.insertar_albaran(
-                proveedor_id=proveedor["id"],
-                numero_albaran=albaran_data.numero_albaran,
-                fecha=albaran_data.fecha,
-                forma_pago=albaran_data.forma_pago,
-                base_imponible=albaran_data.base_imponible,
-                total_iva=albaran_data.total_iva,
-                total=albaran_data.total,
-                imagen_url=imagen_url,
-                detalle_iva=detalle_iva_dicts,
-                imagen_hash=imagen_hash,
-            )
-        except Exception as e:
-            if "23505" in str(e):
-                # La BD rechazó el insert por constraint UNIQUE — tratar como duplicado
-                await db.actualizar_job(job_id, estado="completado")
-                existing = await db.buscar_albaran_duplicado_norm(numero_norm, proveedor["id"])
-                if existing is None and albaran_data.total is not None:
-                    existing = await db.buscar_albaran_duplicado_combinacion(
-                        proveedor["id"], albaran_data.fecha, albaran_data.total
-                    )
-                return ResultadoProcesamiento(
-                    albaran_id=existing["id"] if existing else "unknown",
-                    proveedor_id=proveedor["id"],
-                    proveedor_nombre=proveedor["nombre"],
-                    numero_albaran=albaran_data.numero_albaran,
-                    fecha=albaran_data.fecha,
-                    forma_pago=albaran_data.forma_pago,
-                    total=albaran_data.total,
-                    num_lineas=len(albaran_data.lineas),
-                    es_proveedor_nuevo=False,
-                    es_duplicado=True,
-                    es_duplicado_fecha=existing.get("creado_en") if existing else None,
-                    es_duplicado_numero_original=existing.get("numero_albaran") if existing else None,
-                    lineas_con_revision=0,
-                    alertas_precio=[],
-                    imagen_url=imagen_url,
-                    lineas_para_confirmacion=[],
-                )
-            raise
-
-        # h0) Subir imagen a Storage SOLO ahora — el albarán está guardado y no es duplicado.
-        # Si falla la subida, el albarán queda guardado sin URL (no se pierde el dato).
-        ruta = f"albaranes/{chat_id}/{job_id}.jpg"
-        try:
-            imagen_url = await db.subir_imagen("albaranes", ruta, imagen_bytes)
-            await db.actualizar_campo_albaran(albaran_row["id"], imagen_url=imagen_url)
-            await db.actualizar_job(job_id, imagen_url=imagen_url)
-        except Exception as e:
-            logger.warning("No se pudo subir imagen: %s — albarán guardado sin URL", e)
-
-        # h) Normalizar y guardar líneas — 3 fases en paralelo
-        await progress_callback(f"Procesando {len(albaran_data.lineas)} productos...")
-        alertas_precio: list[dict] = []
-
-        # Fase 0: cargar catálogo del proveedor una sola vez
-        productos_existentes = await db.buscar_productos_por_proveedor(proveedor["id"])
-
-        # Fase 1: normalizar todas las líneas en una sola llamada LLM (batch)
-        norms = await normalizar_productos_batch(
-            proveedor["id"],
-            [linea.nombre_producto for linea in albaran_data.lineas],
-            productos_existentes,
-        )
-
-        # Fase 2: buscar/crear productos en catálogo en paralelo
-        producto_rows = await asyncio.gather(*[
-            db.buscar_o_crear_producto_catalogo(
-                proveedor_id=proveedor["id"],
-                nombre_normalizado=norm.normalized_name,
-                unidad_base=linea.unidad,
-                formato_habitual=linea.formato_envase,
-            )
-            for norm, linea in zip(norms, albaran_data.lineas)
-        ])
-
-        # Invalidar caché si se crearon productos nuevos (para el próximo albarán)
-        if any(norm.is_new_product for norm in norms):
-            invalidar_cache_proveedor(proveedor["id"])
-
-        # Construir lineas_para_insertar
-        lineas_para_insertar: list[dict] = [
-            {
-                "albaran_id": albaran_row["id"],
-                "producto_catalogo_id": producto_row["id"],
-                "descripcion_original": linea.descripcion_original or linea.nombre_producto,
-                "descripcion_limpia": norm.normalized_name,
-                "cantidad": linea.cantidad,
-                "unidad": linea.unidad,
-                "precio_unitario": linea.precio_unitario,
-                "importe_neto": linea.importe_neto,
-                "peso_unitario_g": linea.peso_unitario_g,
-                "unidades_por_envase": linea.unidades_por_envase,
-                "peso_total_kg": linea.peso_total_kg,
-                "volumen_unitario_l": linea.volumen_unitario_l,
-                "formato_envase": linea.formato_envase,
-                "numero_lote": linea.numero_lote,
-                "caducidad": _parsear_fecha_caducidad(linea.caducidad),
-                "descuento_pct": linea.descuento_pct,
-            }
-            for norm, linea, producto_row in zip(norms, albaran_data.lineas, producto_rows)
-        ]
-
-        # Fase 3: actualizar precios históricos en paralelo
-        async def _actualizar_precio_linea(
-            norm_result: Any, linea: Any, producto_row: dict
-        ) -> dict | None:
-            if not linea.precio_unitario:
-                return None
-            try:
-                anterior, alerta = await db.actualizar_precio_catalogo(
-                    producto_row["id"], linea.precio_unitario
-                )
-                if alerta and anterior:
-                    pct = (linea.precio_unitario - anterior) / anterior * 100
-                    return {
-                        "producto": norm_result.normalized_name,
-                        "anterior": anterior,
-                        "nuevo": linea.precio_unitario,
-                        "pct": round(pct, 1),
-                    }
-            except Exception as e:
-                logger.warning("Error actualizando precio de %s: %s", norm_result.normalized_name, e)
-            return None
-
-        resultados_precio = await asyncio.gather(*[
-            _actualizar_precio_linea(norm, linea, producto_row)
-            for norm, linea, producto_row in zip(norms, albaran_data.lineas, producto_rows)
-        ])
-        alertas_precio = [r for r in resultados_precio if r is not None]
-
-        # Añadir confianza y requiere_revision a cada línea antes de insertar
-        for i, (linea, linea_dict) in enumerate(zip(albaran_data.lineas, lineas_para_insertar)):
-            ok, motivo = _validar_linea(linea)
-            sin_datos = linea.importe_neto is None and linea.precio_unitario is None
-            linea_dict["confianza"] = linea.confianza
-            linea_dict["requiere_revision"] = not ok or linea.confianza < 70 or sin_datos
-
-        lineas_insertadas = await db.insertar_lineas(lineas_para_insertar)
-
-        # Recopilar líneas para confirmación (confianza < 70 o requiere_revision)
-        lineas_para_confirmacion: list[dict] = []
-        num = 1
-        for i, (linea, linea_row) in enumerate(zip(albaran_data.lineas, lineas_insertadas)):
-            ok, motivo = _validar_linea(linea)
-            if not ok or linea.confianza < 70:
-                razon = motivo if not ok else f"confianza {linea.confianza}%"
-                norm_name = lineas_para_insertar[i]["descripcion_limpia"]
-                lineas_para_confirmacion.append({
-                    "num": num,
-                    "linea_id": linea_row["id"],
-                    "descripcion": norm_name,
-                    "cantidad": linea.cantidad,
-                    "precio": linea.precio_unitario,
-                    "importe": linea.importe_neto,
-                    "unidad": linea.unidad,
-                    "razon": razon,
-                })
-                num += 1
-
-        # k) Actualizar job
-        await db.actualizar_job(job_id, estado="completado")
-
-        # l) Auditoría
-        await db.registrar_auditoria(
-            tipo="extraccion",
-            resultado="revision" if lineas_con_revision > 0 else "ok",
-            telegram_user_id=chat_id,
-            imagen_url=imagen_url,
-            modelo_ocr=_MODELO_OCR,
-            modelo_llm=_MODELO_LLM,
-            tokens_consumidos=tokens_totales or None,
-            coste_estimado_usd=tokens_totales * (_COSTE_INPUT_POR_TOKEN + _COSTE_OUTPUT_POR_TOKEN) / 2 if tokens_totales else None,
-            detalle={"num_lineas": len(albaran_data.lineas), "alertas": len(alertas_precio)},
-            albaran_id=albaran_row["id"],
-        )
-
-        return ResultadoProcesamiento(
-            albaran_id=albaran_row["id"],
-            proveedor_id=proveedor["id"],
-            proveedor_nombre=proveedor["nombre"],
-            numero_albaran=albaran_data.numero_albaran,
-            fecha=albaran_data.fecha,
-            forma_pago=albaran_data.forma_pago,
-            total=albaran_data.total,
-            num_lineas=len(albaran_data.lineas),
-            es_proveedor_nuevo=es_proveedor_nuevo,
-            es_duplicado=False,
-            lineas_con_revision=lineas_con_revision,
-            alertas_precio=alertas_precio,
-            imagen_url=imagen_url,
-            lineas_para_confirmacion=lineas_para_confirmacion,
-        )
-
-    except Exception as e:
-        await db.actualizar_job(job_id, estado="error", error_detalle=str(e))
-        await db.registrar_auditoria(
-            tipo="extraccion",
-            resultado="error",
-            telegram_user_id=chat_id,
-            imagen_url=imagen_url,
-            modelo_ocr=_MODELO_OCR,
-            modelo_llm=_MODELO_LLM,
-            detalle={"error": str(e)},
-        )
-        raise
-
-
-def _parsear_fecha_caducidad(fecha_str: str | None) -> str | None:
-    if not fecha_str:
-        return None
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
-        try:
-            return datetime.strptime(fecha_str.strip(), fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return None

@@ -1,0 +1,63 @@
+name: albaran-bot
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: albaran-bot:${IMAGE_TAG:-local}
+    environment:
+      TZ: Europe/Madrid
+      ENVIRONMENT: production
+      RUNTIME_DIR: /app/runtime
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?Falta MISTRAL_API_KEY}
+      SUPABASE_URL: ${SUPABASE_URL:?Falta SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?Falta SUPABASE_SERVICE_ROLE_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Falta TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-}
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:?Falta TELEGRAM_ALLOWED_USERS}
+      CUSTOMER_NIFS: ${CUSTOMER_NIFS:-}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-albaranes}
+      MAX_DOCUMENT_BYTES: ${MAX_DOCUMENT_BYTES:-15728640}
+      MAX_PENDING_PER_USER: ${MAX_PENDING_PER_USER:-20}
+      MAX_PENDING_GLOBAL: ${MAX_PENDING_GLOBAL:-100}
+      AUTO_CONFIRM_CLEAN: "false"
+      OCR_MODEL: ${OCR_MODEL:-mistral-ocr-4-0}
+      EXTRACTION_MODEL: ${EXTRACTION_MODEL:-mistral-small-2603}
+      MONTHLY_AI_BUDGET_USD: ${MONTHLY_AI_BUDGET_USD:-25}
+      MONTHLY_TOTAL_BUDGET_USD: ${MONTHLY_TOTAL_BUDGET_USD:-0}
+      OCR_USD_PER_1000_PAGES: ${OCR_USD_PER_1000_PAGES:-4}
+      LLM_INPUT_USD_PER_MILLION_TOKENS: ${LLM_INPUT_USD_PER_MILLION_TOKENS:-0.15}
+      LLM_OUTPUT_USD_PER_MILLION_TOKENS: ${LLM_OUTPUT_USD_PER_MILLION_TOKENS:-0.60}
+      HOSTING_MONTHLY_COST_USD: ${HOSTING_MONTHLY_COST_USD:-0}
+      SUPABASE_MONTHLY_COST_USD: ${SUPABASE_MONTHLY_COST_USD:-0}
+      OTHER_MONTHLY_COST_USD: ${OTHER_MONTHLY_COST_USD:-0}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - runtime-data:/app/runtime
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    cpus: 1.5
+    pids_limit: 128
+    stop_grace_period: 210s
+    healthcheck:
+      test: ["CMD", "python", "/app/ops/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  runtime-data:

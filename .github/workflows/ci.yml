@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  database-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: albaran_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d albaran_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGDATABASE: albaran_ci
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply every migration to a clean PostgreSQL database
+        run: |
+          psql -v ON_ERROR_STOP=1 -f sql/tests/bootstrap_supabase.sql
+          for migration in sql/migrations/*.sql; do
+            psql -v ON_ERROR_STOP=1 -f "$migration"
+          done
+
+      - name: Verify migrations are safe to retry
+        run: |
+          for migration in sql/migrations/*.sql; do
+            psql -v ON_ERROR_STOP=1 -f "$migration"
+          done
+          expected_events="$(find sql/migrations -type f -name '*.sql' ! -name '000_*' ! -name '001_*' | wc -l | tr -d ' ')"
+          test "$(psql -At -v ON_ERROR_STOP=1 -c \
+            "SELECT count(*) FROM audit_events WHERE actor_type='migration')" -eq "$expected_events"
+
+      - name: Run transactional database contract tests
+        run: psql -v ON_ERROR_STOP=1 -f sql/tests/production_contract.sql
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements-dev.lock
+
+      - name: Compile Python
+        run: python -m compileall -q src ops scripts
+
+      - name: Unit tests
+        env:
+          MISTRAL_API_KEY: test-only
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_ANON_KEY: test-only
+          TELEGRAM_BOT_TOKEN: test-only
+          TELEGRAM_ALLOWED_USERS: "1"
+        run: python -m pytest -q
+
+      - name: Validate PostgreSQL migrations
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from pglast import parse_sql
+          for migration in sorted(Path("sql/migrations").glob("*.sql")):
+              parse_sql(migration.read_text())
+          PY
+
+      - name: Dependency vulnerability audit
+        run: python -m pip_audit -r requirements.lock
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build production image
+        run: docker build --tag albaran-bot:ci .
+
+      - name: Verify fail-closed startup
+        run: |
+          set +e
+          docker run --rm \
+            -e MISTRAL_API_KEY=test \
+            -e SUPABASE_URL=https://example.supabase.co \
+            -e SUPABASE_SERVICE_ROLE_KEY=test \
+            -e TELEGRAM_BOT_TOKEN=test \
+            albaran-bot:ci python -c 'print("must not execute")'
+          status=$?
+          set -e
+          test "$status" -eq 78
+
+      - name: Verify container entrypoint and healthcheck
+        run: |
+          docker run --rm \
+            -e MISTRAL_API_KEY=test \
+            -e SUPABASE_URL=https://example.supabase.co \
+            -e SUPABASE_SERVICE_ROLE_KEY=test \
+            -e TELEGRAM_BOT_TOKEN=test \
+            -e TELEGRAM_ALLOWED_USERS=123456789 \
+            albaran-bot:ci python -m compileall -q /app/src /app/ops

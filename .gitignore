@@ -1,6 +1,10 @@
 # Entorno y secretos
 .env
 .env.*
+!.env.example
+
+# Copias locales de base de datos
+backups/
 
 # Entorno virtual Python
 .venv/
@@ -15,6 +19,7 @@ build/
 
 # Logs
 *.log
+runtime/
 
 # macOS
 .DS_Store

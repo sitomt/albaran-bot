@@ -15,23 +15,20 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+import hashlib
 from datetime import datetime, timedelta
 
 from . import supabase_client as db
 from .albaran_processor import _normalizar_numero_albaran, _parsear_numero
+from .config import settings
+from .intake_service import _validate_image
+from .spanish_tax_id import is_valid_spanish_tax_id, normalize_tax_id
 
 logger = logging.getLogger(__name__)
 
 # Estado por chat_id. Estructura del flujo (ver docstring del módulo).
 _manual_flows: dict[int, dict] = {}
-# Foto cuyo OCR falló, a la espera de que el usuario decida meterla a mano (botón inline).
-_foto_pendiente: dict[int, bytes] = {}
 _TIMEOUT = timedelta(minutes=15)
-
-
-def recordar_foto_fallida(chat_id: int, imagen_bytes: bytes) -> None:
-    """Guarda la foto cuyo OCR falló para reaprovecharla si el usuario elige meterla a mano."""
-    _foto_pendiente[chat_id] = imagen_bytes
 
 _MESES = {
     "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
@@ -117,8 +114,70 @@ def _parsear_producto(texto: str) -> tuple[str, float, float] | None:
     return nombre, cantidad, precio
 
 
+def _parsear_producto_detallado(texto: str) -> dict | None:
+    """Nombre | cantidad | tarifa | descuento | neto | importe, todo observado."""
+    partes = [parte.strip() for parte in texto.split("|")]
+    if len(partes) != 6 or not partes[0]:
+        return None
+    cantidad = _num(partes[1])
+    tarifa = _num(partes[2])
+    descuento = _num(partes[3].rstrip("% "))
+    neto = _num(partes[4])
+    importe = _num(partes[5])
+    if (
+        cantidad is None or cantidad <= 0 or tarifa is None or tarifa < 0
+        or descuento is None or not 0 <= descuento < 100
+        or neto is None or neto < 0 or importe is None or importe < 0
+    ):
+        return None
+    neto_esperado = tarifa * (1 - descuento / 100)
+    if abs(neto - neto_esperado) > 0.02 or min(
+        abs(cantidad * neto - importe), abs(cantidad * neto_esperado - importe)
+    ) > 0.03:
+        return None
+    return {
+        "nombre": partes[0], "cantidad": cantidad, "precio": importe / cantidad,
+        "precio_neto_observado": neto,
+        "precio_tarifa": tarifa, "descuento_pct": descuento, "importe": importe,
+        "entrada_detallada": True,
+    }
+
+
 def _total_lineas(flow: dict) -> float:
-    return round(sum(l["cantidad"] * l["precio"] for l in flow["lineas"]), 2)
+    return round(sum(
+        l.get("importe") if l.get("importe") is not None else l["cantidad"] * l["precio"]
+        for l in flow["lineas"]
+    ), 2)
+
+
+def _parsear_totales(texto: str, suma_lineas: float) -> tuple[float, float, float] | None:
+    """Interpreta OK, TOTAL, IVA x o BASE / IVA / TOTAL y valida el cuadre."""
+    raw = texto.strip()
+    if raw.casefold() == "ok":
+        return suma_lineas, 0.0, suma_lineas
+
+    iva_match = re.fullmatch(r"iva\s*[:=]?\s*(.+)", raw, flags=re.IGNORECASE)
+    if iva_match:
+        iva = _num(iva_match.group(1))
+        if iva is None or iva < 0:
+            return None
+        return suma_lineas, round(iva, 2), round(suma_lineas + iva, 2)
+
+    partes = [parte.strip() for parte in raw.split("/")]
+    if len(partes) == 3:
+        valores = [_num(re.sub(r"^(?:base|iva|total)\s*[:=]?\s*", "", p, flags=re.IGNORECASE))
+                   for p in partes]
+        if any(v is None or v < 0 for v in valores):
+            return None
+        base, iva, total = (round(float(v), 2) for v in valores)
+        if abs(base - suma_lineas) > 0.03 or abs(base + iva - total) > 0.03:
+            return None
+        return base, iva, total
+
+    total = _num(raw)
+    if total is None or total <= 0 or total + 0.03 < suma_lineas:
+        return None
+    return suma_lineas, round(total - suma_lineas, 2), round(total, 2)
 
 
 # ── Gestión de estado / ciclo de vida ──────────────────────────────────────────
@@ -146,7 +205,7 @@ def cancelar(chat_id: int) -> str:
 
 # ── Inicio del flujo (paso 1) ──────────────────────────────────────────────────
 
-async def iniciar(chat_id: int) -> str:
+async def iniciar(chat_id: int, user_id: int | None = None) -> str:
     proveedores = await db.listar_todos_proveedores()
     flow = {
         "step": "proveedor",
@@ -156,13 +215,18 @@ async def iniciar(chat_id: int) -> str:
         "fecha": None,
         "lineas": [],
         "forma_pago": None,
+        "base_manual": None,
+        "iva_manual": None,
         "total_manual": None,
         "imagen_url": None,
         "timestamp": datetime.now(),
         "_proveedores": proveedores,
         "_nuevo": None,
-        # Si venimos de una foto cuyo OCR falló, la reaprovechamos (se adjunta al final).
-        "_imagen_bytes": _foto_pendiente.pop(chat_id, None),
+        "_chat_id": chat_id,
+        "_user_id": user_id or chat_id,
+        "_imagen_bytes": None,
+        "_existing_evidence": False,
+        "_durable_ingestion_id": None,
     }
     _manual_flows[chat_id] = flow
 
@@ -171,12 +235,34 @@ async def iniciar(chat_id: int) -> str:
         cuerpo = f"Proveedores registrados:\n{listado}\n\nEscribe el número o el nombre si es uno nuevo."
     else:
         cuerpo = "No hay proveedores registrados todavía. Escribe el nombre del proveedor."
-    nota_foto = "📎 Usaré la foto que enviaste como archivo del albarán.\n\n" if flow["_imagen_bytes"] else ""
+    nota_foto = (
+        "📎 Usaré la foto que ya está guardada como archivo del albarán.\n\n"
+        if flow["_imagen_bytes"] or flow["_existing_evidence"] else ""
+    )
     return (
         "Vamos a registrar un albarán manualmente.\n"
         "(escribe /cancelar en cualquier momento para abortar)\n\n"
         f"{nota_foto}¿De qué proveedor es?\n\n{cuerpo}"
     )
+
+
+async def iniciar_desde_ingestion(chat_id: int, user_id: int, ingestion_id: str) -> str:
+    """Reutiliza el original durable de un OCR fallido sin volver a subirlo."""
+    ingestion = await db.obtener_ingestion(ingestion_id)
+    if not ingestion or ingestion.get("status") not in {
+        "failed", "rejected", "extracted", "needs_review"
+    }:
+        raise ValueError("Ese documento no está disponible para entrada manual")
+    text = await iniciar(chat_id, user_id)
+    flow = _manual_flows[chat_id]
+    flow["_durable_ingestion_id"] = ingestion_id
+    flow["_source_status"] = ingestion.get("status")
+    flow["_existing_evidence"] = bool(
+        ingestion.get("storage_bucket") and ingestion.get("storage_path")
+    )
+    if flow["_existing_evidence"]:
+        text = "📎 Usaré la foto que ya está guardada como archivo del albarán.\n\n" + text
+    return text
 
 
 # ── Manejador principal de texto ────────────────────────────────────────────────
@@ -249,7 +335,13 @@ async def _step_proveedor(flow: dict, texto: str) -> str:
 
 def _step_nuevo_nif(flow: dict, texto: str) -> str:
     if texto.lower() not in ("no", "n"):
-        flow["_nuevo"]["nif"] = texto.strip()
+        nif = texto.strip()
+        normalized = normalize_tax_id(nif)
+        if normalized in settings.customer_nifs_set:
+            return "Ese NIF pertenece al restaurante, no al proveedor. Escribe el NIF del proveedor o NO."
+        if not is_valid_spanish_tax_id(nif):
+            return "Ese NIF/CIF no supera el dígito de control. Revísalo o escribe NO."
+        flow["_nuevo"]["nif"] = nif
     flow["step"] = "nuevo_pago"
     return "¿Forma de pago habitual? (ej: 15 días, 30 días, contado)"
 
@@ -258,16 +350,13 @@ async def _step_nuevo_pago(chat_id: int, flow: dict, texto: str) -> str:
     if texto.lower() not in ("no", "n", ""):
         flow["_nuevo"]["forma_pago"] = texto.strip()
     nuevo = flow["_nuevo"]
-    proveedor, _ = await db.buscar_o_crear_proveedor(
-        nombre=nuevo["nombre"],
-        nif=nuevo["nif"],
-        forma_pago_habitual=nuevo["forma_pago"],
-    )
-    flow["proveedor_id"] = proveedor["id"]
-    flow["proveedor_nombre"] = proveedor["nombre"]
+    # El proveedor no se crea todavía: se publicará dentro de la misma transacción
+    # que el albarán para no dejar catálogos huérfanos al cancelar o fallar.
+    flow["proveedor_id"] = None
+    flow["proveedor_nombre"] = nuevo["nombre"]
     flow["forma_pago"] = nuevo["forma_pago"]  # se podrá sobrescribir después
     flow["step"] = "cabecera"
-    return f"Proveedor «{proveedor['nombre']}» registrado.\n\n" + _pedir_cabecera(proveedor["nombre"])
+    return f"Proveedor nuevo «{nuevo['nombre']}».\n\n" + _pedir_cabecera(nuevo["nombre"])
 
 
 # ── Paso 3: cabecera (número + fecha) ───────────────────────────────────────────
@@ -308,6 +397,9 @@ def _pedir_productos() -> str:
         "Ahora añade los productos uno a uno.\n"
         "Formato: nombre, cantidad, precio neto\n"
         "Ejemplo: Tomate entero, 12, 1.81\n\n"
+        "Si el papel muestra todas las columnas, también puedes escribir:\n"
+        "nombre | cantidad | tarifa | descuento | neto | importe\n"
+        "Ejemplo: Tomate | 10 | 2,00 | 10 | 1,80 | 18,00\n\n"
         "Escribe FIN cuando termines o /corregir para borrar el último producto."
     )
 
@@ -319,19 +411,33 @@ def _step_productos(flow: dict, texto: str) -> str:
         flow["step"] = "total"
         total = _total_lineas(flow)
         return (
-            f"Total calculado de las líneas: {_fmt_importe(total)}\n"
-            "¿Es correcto? Escribe el total real si es diferente, o OK si coincide."
+            f"Base calculada de las líneas: {_fmt_importe(total)}\n\n"
+            "Escribe una de estas opciones:\n"
+            "• OK — no hay IVA y el total coincide.\n"
+            "• IVA 3,78 — añade ese IVA a la base.\n"
+            "• 98,43 — total final; la diferencia se tratará como IVA.\n"
+            "• 94,65 / 3,78 / 98,43 — BASE / IVA / TOTAL.\n\n"
+            "Si falta un porte, envase u otro cargo, escribe ATRÁS y añádelo como producto."
         )
 
-    parsed = _parsear_producto(texto)
-    if not parsed:
+    detailed = _parsear_producto_detallado(texto) if "|" in texto else None
+    parsed = _parsear_producto(texto) if detailed is None and "|" not in texto else None
+    if detailed is None and parsed is None:
         return (
-            "No he entendido el producto. Usa el formato:\n"
-            "  nombre, cantidad, precio neto\n"
-            "Ejemplo: Tomate entero, 12, 1.81"
+            "No he entendido o las cifras no cuadran. Usa:\n"
+            "nombre, cantidad, precio neto\n"
+            "o nombre | cantidad | tarifa | descuento | neto | importe"
         )
-    nombre, cantidad, precio = parsed
-    flow["lineas"].append({"nombre": nombre, "cantidad": cantidad, "precio": precio})
+    if detailed is not None:
+        line = detailed
+        nombre, cantidad, precio = line["nombre"], line["cantidad"], line["precio"]
+    else:
+        nombre, cantidad, precio = parsed
+        line = {
+            "nombre": nombre, "cantidad": cantidad, "precio": precio,
+            "importe": round(cantidad * precio, 2), "entrada_detallada": False,
+        }
+    flow["lineas"].append(line)
     return f"✓ {nombre} × {_cant(cantidad)} a {_fmt_importe(precio)}\n\nAñade otro, o FIN para terminar."
 
 
@@ -357,20 +463,34 @@ def _cant(valor: float) -> str:
 # ── Paso 5: total y forma de pago ───────────────────────────────────────────────
 
 def _step_total(flow: dict, texto: str) -> str:
-    if texto.lower() != "ok":
-        valor = _num(texto)
-        if valor is None or valor <= 0:
-            return "Escribe el total real (ej: 103,08) o OK si el calculado es correcto."
-        flow["total_manual"] = valor
+    if texto.casefold() in {"atrás", "atras", "productos"}:
+        flow["step"] = "productos"
+        return "Vuelve a añadir el cargo como una línea (por ejemplo: Portes, 1, 4,50). Escribe FIN al terminar."
+
+    suma_lineas = _total_lineas(flow)
+    totales = _parsear_totales(texto, suma_lineas)
+    if totales is None:
+        return (
+            "Los importes no cuadran. La BASE debe coincidir con las líneas y BASE + IVA = TOTAL.\n"
+            f"Base de líneas: {_fmt_importe(suma_lineas)}.\n"
+            "Usa OK, IVA 3,78, un total final, o BASE / IVA / TOTAL."
+        )
+    base, iva, total = totales
+    flow["base_manual"] = base
+    flow["iva_manual"] = iva
+    flow["total_manual"] = total
     flow["step"] = "forma_pago"
-    return "¿Forma de pago? (ej: 15 días, 30 días, contado)\nO escribe NO si no aplica."
+    return (
+        f"Cuadre: {_fmt_importe(base)} + IVA {_fmt_importe(iva)} = {_fmt_importe(total)}.\n\n"
+        "¿Forma de pago? (ej: 15 días, 30 días, contado)\nO escribe NO si no aplica."
+    )
 
 
 def _step_forma_pago(flow: dict, texto: str) -> str:
     if texto.lower() not in ("no", "n"):
         flow["forma_pago"] = texto.strip()
     # Si ya tenemos la foto (venía de un OCR fallido), saltamos el paso de foto.
-    if flow.get("_imagen_bytes"):
+    if flow.get("_imagen_bytes") or flow.get("_existing_evidence"):
         flow["step"] = "confirmacion"
         return _resumen(flow)
     flow["step"] = "foto"
@@ -398,10 +518,10 @@ async def manejar_foto(chat_id: int, imagen_bytes: bytes) -> str | None:
     if not flow or flow["step"] != "foto":
         return None
     flow["timestamp"] = datetime.now()
-    ruta = f"albaranes/manual/{chat_id}/{uuid.uuid4().hex}.jpg"
     try:
-        flow["imagen_url"] = await db.subir_imagen("albaranes", ruta, imagen_bytes)
-        msg = "Foto guardada.\n\n"
+        _validate_image(imagen_bytes)
+        flow["_imagen_bytes"] = imagen_bytes
+        msg = "Foto preparada; se guardará al confirmar.\n\n"
     except Exception as e:
         logger.warning("No se pudo subir la foto del albarán manual: %s", e)
         msg = "No pude guardar la foto, pero seguimos sin ella.\n\n"
@@ -412,7 +532,9 @@ async def manejar_foto(chat_id: int, imagen_bytes: bytes) -> str | None:
 # ── Paso 7: confirmación e inserción ────────────────────────────────────────────
 
 def _resumen(flow: dict) -> str:
-    total = flow["total_manual"] if flow["total_manual"] is not None else _total_lineas(flow)
+    base = flow["base_manual"] if flow["base_manual"] is not None else _total_lineas(flow)
+    iva = flow["iva_manual"] if flow["iva_manual"] is not None else 0.0
+    total = flow["total_manual"] if flow["total_manual"] is not None else base + iva
     cabecera = [flow["proveedor_nombre"]]
     if flow["numero_albaran"]:
         cabecera.append(f"Nº {flow['numero_albaran']}")
@@ -422,13 +544,21 @@ def _resumen(flow: dict) -> str:
     lineas = [
         "Resumen del albarán:",
         " | ".join(cabecera),
-        f"{len(flow['lineas'])} productos | Total: {_fmt_importe(total)}",
+        f"{len(flow['lineas'])} productos",
+        f"Base: {_fmt_importe(base)} + IVA: {_fmt_importe(iva)} = Total: {_fmt_importe(total)}",
         "",
         "Líneas:",
     ]
     for l in flow["lineas"]:
-        lineas.append(f" · {l['nombre']} × {_cant(l['cantidad'])} a {_fmt_importe(l['precio'])}")
-    if flow.get("imagen_url") or flow.get("_imagen_bytes"):
+        if l.get("entrada_detallada"):
+            lineas.append(
+                f" · {l['nombre']} × {_cant(l['cantidad'])} | tarifa {_fmt_importe(l['precio_tarifa'])} "
+                f"− {_cant(l['descuento_pct'])}% → neto {_fmt_importe(l['precio_neto_observado'])} "
+                f"= {_fmt_importe(l['importe'])}"
+            )
+        else:
+            lineas.append(f" · {l['nombre']} × {_cant(l['cantidad'])} a {_fmt_importe(l['precio'])}")
+    if flow.get("imagen_url") or flow.get("_imagen_bytes") or flow.get("_existing_evidence"):
         lineas.append("📎 Con foto adjunta.")
     lineas.append("")
     lineas.append("Escribe OK para guardar o /cancelar para abortar.")
@@ -436,14 +566,27 @@ def _resumen(flow: dict) -> str:
 
 
 async def _step_confirmacion(chat_id: int, flow: dict, texto: str) -> str:
-    if texto.lower() != "ok":
+    if texto.lower() == "nuevo":
+        flow["_duplicate_override"] = True
+    elif texto.lower() != "ok":
         return "Escribe OK para guardar el albarán o /cancelar para abortar."
     try:
         resultado = await _insertar(flow)
     except Exception as e:
         logger.error("Error insertando albarán manual: %s", e, exc_info=True)
-        _manual_flows.pop(chat_id, None)
-        return f"Error al guardar el albarán: {e}"
+        flow["timestamp"] = datetime.now()
+        return (
+            "No se ha guardado el albarán. Tus datos siguen disponibles durante "
+            "15 minutos: escribe OK para reintentar o /cancelar."
+        )
+
+    if resultado.get("probable_duplicate"):
+        duplicate = resultado["dup"]
+        return (
+            "Posible duplicado: ya existe un albarán del mismo proveedor, fecha y total "
+            f"(Nº {duplicate.get('numero_albaran') or 'sin número'}).\n"
+            "Si es otra entrega legítima escribe NUEVO; si no, usa /cancelar."
+        )
 
     _manual_flows.pop(chat_id, None)
     if resultado.get("duplicado"):
@@ -462,79 +605,145 @@ async def _step_confirmacion(chat_id: int, flow: dict, texto: str) -> str:
     )
 
 
-async def _detectar_duplicado(proveedor_id: str, proveedor_nombre: str, fecha: str,
-                              total: float, numero: str | None) -> dict | None:
-    """Misma detección que el pipeline OCR: proveedor+fecha+total, nombre+fecha+total, número."""
-    dup = await db.buscar_albaran_duplicado_combinacion(proveedor_id, fecha, total)
-    if dup:
-        return dup
-    dup = await db.buscar_albaran_duplicado_por_nombre_proveedor(proveedor_nombre, fecha, total)
-    if dup:
-        return dup
-    numero_norm = _normalizar_numero_albaran(numero or "")
-    if numero_norm:
-        dup = await db.buscar_albaran_duplicado_norm(numero_norm, proveedor_id)
-        if dup:
-            return dup
-    return None
-
-
 async def _insertar(flow: dict) -> dict:
-    proveedor_id = flow["proveedor_id"]
-    total = flow["total_manual"] if flow["total_manual"] is not None else _total_lineas(flow)
+    return await _insertar_atomico(flow)
 
-    # Subir la foto reaprovechada (OCR fallido) si aún no se ha subido.
-    if not flow.get("imagen_url") and flow.get("_imagen_bytes"):
-        try:
-            ruta = f"albaranes/manual/{uuid.uuid4().hex}.jpg"
-            flow["imagen_url"] = await db.subir_imagen("albaranes", ruta, flow["_imagen_bytes"])
-        except Exception as e:
-            logger.warning("No se pudo subir la foto reaprovechada del albarán manual: %s", e)
 
-    # Detección de duplicados ANTES de insertar (req: los manuales SÍ se comprueban)
-    dup = await _detectar_duplicado(proveedor_id, flow["proveedor_nombre"], flow["fecha"], total, flow["numero_albaran"])
-    if dup:
-        return {"duplicado": True, "dup": dup}
+async def _insertar_atomico(flow: dict) -> dict:
+    """Publica un alta manual mediante la misma transacción canónica que el OCR."""
+    suma_lineas = _total_lineas(flow)
+    total_base = flow["base_manual"] if flow["base_manual"] is not None else suma_lineas
+    total_iva = flow["iva_manual"] if flow["iva_manual"] is not None else 0.0
+    total = flow["total_manual"] if flow["total_manual"] is not None else total_base + total_iva
+    if abs(total_base - suma_lineas) > 0.03 or abs(total_base + total_iva - total) > 0.03:
+        raise ValueError("El desglose manual no cumple BASE = líneas y BASE + IVA = TOTAL")
 
-    albaran = await db.insertar_albaran(
-        proveedor_id=proveedor_id,
-        numero_albaran=flow["numero_albaran"],
-        fecha=flow["fecha"],
-        forma_pago=flow["forma_pago"],
-        base_imponible=None,
-        total_iva=None,
-        total=total,
-        imagen_url=flow.get("imagen_url"),
-        origen="manual",
-    )
-
-    lineas_insert = []
-    productos = []
-    for l in flow["lineas"]:
-        prod = await db.buscar_o_crear_producto_catalogo(
-            proveedor_id=proveedor_id,
-            nombre_normalizado=l["nombre"],
+    # El número del proveedor es identidad fuerte. Proveedor+fecha+total solo
+    # detiene para comparar: dos entregas legítimas pueden coincidir en importe.
+    if flow.get("proveedor_id") and flow.get("numero_albaran"):
+        number_duplicate = await db.buscar_albaran_duplicado_norm(
+            _normalizar_numero_albaran(flow["numero_albaran"]), flow["proveedor_id"]
         )
-        productos.append(prod)
-        lineas_insert.append({
-            "albaran_id": albaran["id"],
-            "producto_catalogo_id": prod["id"],
-            "descripcion_original": l["nombre"],
-            "descripcion_limpia": l["nombre"],
-            "cantidad": l["cantidad"],
-            "unidad": None,
-            "precio_unitario": l["precio"],
-            "importe_neto": round(l["cantidad"] * l["precio"], 2),
-            "confianza": 100,
-            "requiere_revision": False,
-        })
-    await db.insertar_lineas(lineas_insert)
+        if number_duplicate:
+            return {"duplicado": True, "dup": number_duplicate, "total": total}
+    probable = await db.buscar_albaran_duplicado_por_nombre_proveedor(
+        flow["proveedor_nombre"], flow["fecha"], total
+    )
+    if probable and not flow.get("_duplicate_override"):
+        return {"probable_duplicate": True, "dup": probable, "total": total}
 
-    # Mantener precios de catálogo al día (como en el pipeline OCR) para las consultas
-    for prod, l in zip(productos, flow["lineas"]):
+    ingestion_id = flow.get("_durable_ingestion_id") or str(uuid.uuid4())
+    durable_already_created = bool(flow.get("_durable_ingestion_id"))
+    bucket = path = content_type = image_hash = None
+    byte_size = 0
+    image_bytes = flow.get("_imagen_bytes")
+    if image_bytes and not durable_already_created:
+        content_type, extension = _validate_image(image_bytes)
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        bucket = settings.STORAGE_BUCKET
+        path = f"manual/{flow.get('proveedor_id') or 'nuevo'}/{ingestion_id}.{extension}"
+        await db.subir_original_privado(bucket, path, image_bytes, content_type)
+        byte_size = len(image_bytes)
+    idempotency_key = f"manual:{flow.get('_chat_id', 'telegram')}:{ingestion_id}"
+    if durable_already_created:
+        await db.actualizar_ingestion(
+            ingestion_id, status="extracted", failed_at=None, duplicate_reason=None
+        )
+    if not durable_already_created:
         try:
-            await db.actualizar_precio_catalogo(prod["id"], l["precio"])
-        except Exception as e:
-            logger.warning("No se pudo actualizar precio de %s: %s", l["nombre"], e)
-
-    return {"duplicado": False, "albaran": albaran, "total": total}
+            await db.crear_ingestion_manual(
+                ingestion_id=ingestion_id, idempotency_key=idempotency_key,
+                telegram_user_id=int(flow.get("_user_id") or flow.get("_chat_id") or 0),
+                telegram_chat_id=int(flow.get("_chat_id") or flow.get("_user_id") or 0),
+                storage_bucket=bucket, storage_path=path, content_type=content_type,
+                byte_size=byte_size, image_hash=image_hash,
+                metadata={"provider": flow["proveedor_nombre"], "date": flow["fecha"], "total": total},
+            )
+            flow["_durable_ingestion_id"] = ingestion_id
+        except Exception:
+            if bucket and path:
+                try:
+                    await db.borrar_original_privado(bucket, path)
+                except Exception:
+                    logger.exception("No se pudo retirar el original huérfano %s", path)
+            raise
+    header = {
+        "proveedor_id": flow.get("proveedor_id"),
+        "proveedor_nombre": flow["proveedor_nombre"],
+        "proveedor_nif": (flow.get("_nuevo") or {}).get("nif"),
+        "forma_pago_habitual": (flow.get("_nuevo") or {}).get("forma_pago"),
+        "numero_albaran": flow["numero_albaran"],
+        "fecha": flow["fecha"],
+        "forma_pago": flow["forma_pago"],
+        "base_imponible": total_base,
+        "total_iva": total_iva,
+        "total": total,
+        "detalle_iva": None,
+        "origen": "manual",
+    }
+    if not header["proveedor_id"]:
+        header.pop("proveedor_id")
+    lines = [{
+        "descripcion_original": line["nombre"],
+        "descripcion_limpia": line["nombre"],
+        "cantidad": line["cantidad"],
+        "unidad": line.get("unidad") or "ud",
+        "precio_unitario": line["precio"],
+        "importe_neto": round(
+            line.get("importe") if line.get("importe") is not None
+            else line["cantidad"] * line["precio"], 2
+        ),
+        "descuento_pct": line.get("descuento_pct"),
+        "confianza": 100,
+        "valores_observados": {
+            "source": "manual", "precio_tarifa": line.get("precio_tarifa"),
+            "descuento_pct": line.get("descuento_pct"),
+            "precio_neto": line.get("precio_neto_observado", line["precio"]),
+            "importe_neto": line.get("importe"),
+        },
+        "valores_calculados": (
+            {"precio_unitario_aceptado_desde_importe": line["precio"]}
+            if line.get("entrada_detallada") else {}
+        ),
+        "decisiones": {
+            "accepted_by_user": True,
+            "input_mode": "detailed" if line.get("entrada_detallada") else "net_fast",
+        },
+    } for line in flow["lineas"]]
+    try:
+        attempt = await db.siguiente_intento_extraccion(ingestion_id)
+        artifact = await db.registrar_artefacto_extraccion(
+            ingestion_id=ingestion_id, attempt=attempt, artifact_type="candidate",
+            payload={"header": header, "lines": lines, "observed": {"source": "manual"}},
+            prompt_version="manual-v1", complete=True,
+        )
+        if flow.get("_source_status") in {"extracted", "needs_review"}:
+            await db.resolver_revisiones_abiertas(
+                ingestion_id, status="rejected",
+                resolved_by=f"telegram_user:{flow.get('_user_id') or flow.get('_chat_id')}",
+                note="Candidato OCR sustituido por transcripción manual del mismo original",
+            )
+            await db.registrar_evento_auditoria(
+                "candidate.replaced_by_manual", ingestion_id=ingestion_id,
+                actor_type="telegram_user",
+                actor_id=str(flow.get("_user_id") or flow.get("_chat_id") or "unknown"),
+                data={"manual_artifact_id": artifact["id"]},
+            )
+        result = await db.confirmar_albaran_atomico(
+            ingestion_id=ingestion_id, idempotency_key=idempotency_key,
+            actor_type="telegram_user",
+            actor_id=str(flow.get("_user_id") or flow.get("_chat_id") or "unknown"),
+            albaran=header, lineas=lines, extraction_artifact_id=artifact["id"],
+        )
+    except Exception:
+        from datetime import timezone
+        await db.actualizar_ingestion(
+            ingestion_id, status="failed", failed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await db.registrar_evento_auditoria(
+            "manual.confirmation_failed", ingestion_id=ingestion_id,
+            actor_type="telegram_user",
+            actor_id=str(flow.get("_user_id") or flow.get("_chat_id") or "unknown"),
+        )
+        raise
+    return {"duplicado": False, "albaran": {"id": result["albaran_id"]}, "total": total}

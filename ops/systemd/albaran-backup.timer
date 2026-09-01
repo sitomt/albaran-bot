@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup diario de Albaran Bot
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 Europe/Madrid
+Persistent=true
+RandomizedDelaySec=10m
+Unit=albaran-backup.service
+
+[Install]
+WantedBy=timers.target
+
