@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import io
 import re
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytz
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -27,12 +27,20 @@ from . import manual_albaran
 from .query_engine import consultar
 from .queue_manager import start_durable_workers
 from .conversation_history import agregar_turno, obtener_historial, limpiar_historial
+from . import review_service
 from .intake_service import receive_image
 from .review_service import (
+    acciones_sugeridas,
     approve_all,
+    atajos_de_correccion,
     build_review_view,
+    campos_de_cabecera,
+    campos_de_linea,
     correct_candidate,
+    lineas_corregibles,
+    pregunta_de_correccion,
     reject_ingestion,
+    titulo_de_linea,
 )
 
 logging.basicConfig(
@@ -620,7 +628,24 @@ def _review_markup(view, ingestion_id: str) -> InlineKeyboardMarkup:
                 "No es duplicado", callback_data=f"rv:notdup:{ingestion_id}{suffix}"
             ),
         ])
+    # Arreglos de un toque para lo que bloquea: evitan que la persona tenga que
+    # deducir el campo y teclear un /corregir con la sintaxis correcta.
+    sugeridas = acciones_sugeridas(view)
+    if sugeridas:
+        buttons.append([
+            InlineKeyboardButton(texto, callback_data=f"fix:{accion}:{ingestion_id}")
+            for texto, accion in sugeridas[:2]
+        ])
+    # Tras corregir a mano, el dato que casi seguro sigue mal tiene su propio
+    # botón: llegar a él por el menú es repetir tres toques ya conocidos.
+    for texto, destino in atajos_de_correccion(view):
+        buttons.append([InlineKeyboardButton(
+            texto, callback_data=f"ed:go:{ingestion_id[:8]}:{'|'.join(destino)}"
+        )])
     buttons.extend([
+        [InlineKeyboardButton(
+            "✏️ Corregir un dato", callback_data=f"ed:menu:{ingestion_id[:8]}"
+        )],
         [InlineKeyboardButton(
             "✍️ Introducir a mano", callback_data=f"manual:start:{ingestion_id}"
         )],
@@ -691,6 +716,168 @@ async def _send_review_callback(context, chat_id: int, view, ingestion_id: str) 
         )
 
 
+# ── Corrección guiada de un dato suelto ──────────────────────────────────────
+# Lo más habitual al revisar un albarán no es que esté todo mal, es que UNA cifra
+# se haya leído regular: un 15,9 donde pone 15,4. Hasta ahora eso obligaba a
+# escribir «/corregir 26e63c27 linea 1 cantidad 15,4», con la referencia del
+# documento, la palabra "linea", el número correcto y el nombre interno del
+# campo. Cuatro cosas que hay que saber para arreglar una.
+#
+# Ahora son tres toques y un número: se elige el producto, se elige el dato, y el
+# bot pregunta y se queda esperando. Nada de sintaxis ni de referencias.
+#
+# `_CORRECCIONES_EN_CURSO` guarda qué dato está esperando cada chat. Vive en
+# memoria a propósito: si el bot se reinicia lo peor que pasa es que el siguiente
+# mensaje se trate como una consulta normal, que es lo que era antes de empezar.
+_CORRECCIONES_EN_CURSO: dict[int, dict] = {}
+
+# Una pregunta abierta caduca. Si alguien pulsa "corregir la cantidad", se
+# distrae y media hora después escribe "cuánto gasté en junio", esa frase no
+# puede acabar tratada como el valor de un campo: se perdería la consulta y se
+# intentaría meter una pregunta dentro de un albarán.
+_ESPERA_MAXIMA = timedelta(minutes=15)
+
+
+def _correccion_pendiente(chat_id: int) -> dict | None:
+    pendiente = _CORRECCIONES_EN_CURSO.get(chat_id)
+    if not pendiente:
+        return None
+    if datetime.now(timezone.utc) - pendiente["desde"] > _ESPERA_MAXIMA:
+        _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+        return None
+    return pendiente
+
+
+def _codificar_destino(destino: list[str]) -> str:
+    return "|".join(destino)
+
+
+def _teclado_de_correccion(
+    opciones: list[tuple[list[str], str]], referencia: str, volver: str
+) -> InlineKeyboardMarkup:
+    filas = [
+        [InlineKeyboardButton(
+            etiqueta, callback_data=f"ed:go:{referencia}:{_codificar_destino(destino)}"
+        )]
+        for destino, etiqueta in opciones
+    ]
+    filas.append([InlineKeyboardButton("← Volver", callback_data=volver)])
+    return InlineKeyboardMarkup(filas)
+
+
+async def _manejar_correccion_guiada(update: Update, context: CallbackContext, data: str) -> None:
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    partes = data.split(":", 3)
+    accion, referencia = partes[1], partes[2]
+    try:
+        ingestion = await db.buscar_ingestion_por_referencia(referencia, user_id)
+        if not ingestion:
+            await query.edit_message_text("Ese documento ya no está pendiente de revisión.")
+            return
+        if str(ingestion.get("status")) in review_service._ESTADOS_CERRADOS:
+            await query.edit_message_text(
+                "Ese albarán ya está guardado, así que aquí no se puede tocar.\n"
+                f"Archívalo con «/anular {referencia} el motivo» y vuelve a subir la foto."
+            )
+            return
+        view = await build_review_view(ingestion["id"], user_id)
+
+        if accion == "menu":
+            _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+            filas = [
+                [InlineKeyboardButton(etiqueta, callback_data=f"ed:l:{referencia}:{numero}")]
+                for numero, etiqueta in lineas_corregibles(view)
+            ]
+            filas.append([InlineKeyboardButton(
+                "📄 Fecha, nº, proveedor, totales", callback_data=f"ed:h:{referencia}"
+            )])
+            filas.append([InlineKeyboardButton("✖️ Dejarlo como está", callback_data=f"ed:x:{referencia}")])
+            await query.edit_message_text(
+                "¿Qué dato está mal?", reply_markup=InlineKeyboardMarkup(filas)
+            )
+            return
+
+        if accion == "l":
+            numero = int(partes[3])
+            await query.edit_message_text(
+                f"{titulo_de_linea(view, numero)}\n\n¿Qué corrijo?",
+                reply_markup=_teclado_de_correccion(
+                    campos_de_linea(view, numero), referencia, f"ed:menu:{referencia}"
+                ),
+            )
+            return
+
+        if accion == "h":
+            await query.edit_message_text(
+                "¿Qué corrijo?",
+                reply_markup=_teclado_de_correccion(
+                    campos_de_cabecera(view), referencia, f"ed:menu:{referencia}"
+                ),
+            )
+            return
+
+        if accion == "go":
+            destino = partes[3].split("|")
+            _CORRECCIONES_EN_CURSO[chat_id] = {
+                "ingestion_id": ingestion["id"], "referencia": referencia,
+                "destino": destino, "desde": datetime.now(timezone.utc),
+            }
+            await query.edit_message_text(
+                pregunta_de_correccion(view, destino)
+                + "\n\n(o escribe «cancelar» para dejarlo)"
+            )
+            return
+
+        if accion == "x":
+            _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+            await query.edit_message_text("Vale, no toco nada. Te dejo la revisión debajo.")
+            await _send_review_callback(context, chat_id, view, ingestion["id"])
+            return
+    except Exception as exc:
+        logger.error("Corrección guiada fallida (%s): %s", data, exc, exc_info=True)
+        _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+        await context.bot.send_message(chat_id=chat_id, text="No pude abrir ese dato para corregirlo.")
+
+
+_CANCELAR = {"cancelar", "cancela", "nada", "déjalo", "dejalo", "no"}
+
+
+async def _aplicar_correccion_guiada(update: Update, context: CallbackContext, texto: str) -> None:
+    chat_id = update.effective_chat.id
+    pendiente = _CORRECCIONES_EN_CURSO.get(chat_id)
+    if not pendiente:
+        return
+    valor = (texto or "").strip()
+    if valor.lower() in _CANCELAR:
+        _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+        view = await build_review_view(pendiente["ingestion_id"], update.effective_user.id)
+        await update.message.reply_text("Cancelado, no he tocado nada.")
+        await _send_review_callback(context, chat_id, view, pendiente["ingestion_id"])
+        return
+    try:
+        view = await correct_candidate(
+            pendiente["referencia"], update.effective_user.id, pendiente["destino"] + [valor]
+        )
+    except ValueError as exc:
+        # El dato no vale (una fecha imposible, un número con letras). Se mantiene
+        # la pregunta abierta: reintentar es escribir otra vez, no volver a navegar.
+        await update.message.reply_text(f"{exc}\n\nInténtalo otra vez, o escribe «cancelar».")
+        return
+    except Exception as exc:
+        logger.error("No se pudo aplicar la corrección guiada: %s", exc, exc_info=True)
+        _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+        await update.message.reply_text("No pude aplicar esa corrección.")
+        return
+    _CORRECCIONES_EN_CURSO.pop(chat_id, None)
+    # Se dice qué ha cambiado y qué ha arrastrado el cambio. "Corregido" a secas
+    # obliga a releer el albarán entero para comprobar que se tocó lo que se
+    # quería, y deja invisible el importe que se recalculó solo.
+    await update.message.reply_text(f"✅ {view.ultimo_cambio or 'Corregido'}")
+    await _send_review_callback(context, chat_id, view, view.ingestion_id)
+
+
 async def handle_callback(update: Update, context: CallbackContext) -> None:
     """Maneja los botones inline. Por ahora: 'Introducir a mano' tras un OCR fallido."""
     query = update.callback_query
@@ -721,6 +908,29 @@ async def handle_callback(update: Update, context: CallbackContext) -> None:
         except Exception as exc:
             logger.error("No se pudo iniciar el modo manual: %s", exc, exc_info=True)
             await context.bot.send_message(chat_id=chat_id, text="No pude abrir ese documento en modo manual.")
+        return
+    if query.data and query.data.startswith("ed:"):
+        await _manejar_correccion_guiada(update, context, query.data)
+        return
+
+    if query.data and query.data.startswith("fix:"):
+        _, accion, ingestion_id = query.data.split(":", 2)
+        user_id = update.effective_user.id
+        try:
+            if accion == "hoy":
+                args = ["fecha", date.today().strftime("%d/%m/%Y")]
+            elif accion == "cargo":
+                args = ["cargo"]
+            else:
+                raise ValueError("Acción no reconocida")
+            view = await correct_candidate(ingestion_id[:8], user_id, args)
+            await query.edit_message_text("Aplicado. Te dejo la revisión actualizada debajo.")
+            await _send_review_callback(context, chat_id, view, ingestion_id)
+        except Exception as exc:
+            logger.error("No se pudo aplicar el arreglo rápido: %s", exc, exc_info=True)
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"No pude aplicarlo: {exc}"
+            )
         return
     if query.data and query.data.startswith("job:retry:"):
         ingestion_id = query.data.split(":", 2)[2]
@@ -868,6 +1078,9 @@ async def handle_photo(update: Update, context: CallbackContext) -> None:
     if not _usuario_autorizado(update):
         await _rechazar(update)
         return
+    # Mandar una foto es empezar otra cosa: si había una pregunta de corrección
+    # abierta, se abandona aquí en vez de tragarse el siguiente mensaje suelto.
+    _CORRECCIONES_EN_CURSO.pop(update.effective_chat.id, None)
     photo = update.message.photo[-1]
     await _handle_image_file(
         update, context, file_id=photo.file_id,
@@ -898,6 +1111,12 @@ async def handle_text(update: Update, context: CallbackContext) -> None:
         return
 
     chat_id = update.effective_chat.id
+
+    # Corrección guiada esperando un valor: el siguiente mensaje ES ese valor,
+    # no una consulta. Sin esto, escribir "15,4" acabaría en el motor de consultas.
+    if _correccion_pendiente(chat_id):
+        await _aplicar_correccion_guiada(update, context, update.message.text)
+        return
 
     # Entrada manual en curso: tiene prioridad sobre todo lo demás.
     if manual_albaran.flujo_activo(chat_id):

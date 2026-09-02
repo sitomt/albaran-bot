@@ -335,7 +335,9 @@ async def _extract(ocr_text: str, client: Mistral) -> tuple[dict[str, Any], Usag
     return parsed, usage, duration_ms
 
 
-def _candidate_payload(model: AlbaranLLM, observed: dict[str, Any]) -> dict[str, Any]:
+def _candidate_payload(
+    model: AlbaranLLM, observed: dict[str, Any], ocr_text: str = "",
+) -> dict[str, Any]:
     extracted_nif = model.proveedor_nif
     normalized_nif = normalize_tax_id(extracted_nif)
     is_customer_nif = normalized_nif in settings.customer_nifs_set
@@ -368,9 +370,13 @@ def _candidate_payload(model: AlbaranLLM, observed: dict[str, Any]) -> dict[str,
         },
     }
     observed_lines = observed.get("lineas") if isinstance(observed.get("lineas"), list) else []
+    # Las filas de catálogo descartadas dejan huecos: hay que volver a la posición
+    # que la línea ocupaba en la respuesta original, no a la que ocupa ahora.
+    posiciones = getattr(model, "indices_conservados", None) or list(range(len(model.lineas)))
     lines: list[dict[str, Any]] = []
     for index, line in enumerate(model.lineas):
-        raw_line = observed_lines[index] if index < len(observed_lines) else {}
+        origen = posiciones[index] if index < len(posiciones) else index
+        raw_line = observed_lines[origen] if origen < len(observed_lines) else {}
         accepted = line.model_dump(mode="json", exclude={"precio_tarifa", "precio_neto"})
         accepted["descripcion_original"] = line.descripcion_original or line.nombre_producto
         accepted["descripcion_limpia"] = line.nombre_producto
@@ -381,7 +387,177 @@ def _candidate_payload(model: AlbaranLLM, observed: dict[str, Any]) -> dict[str,
         }
         accepted["decisiones"] = {"rule": "net-price-v2", "requires_human_acceptance": True}
         lines.append(accepted)
+    _derivar_totales_ausentes(header, lines, ocr_text)
+    if getattr(model, "lineas_descartadas", 0):
+        header.setdefault("decisiones", {})["lineas"] = {
+            "rule": "filas-de-catalogo-descartadas",
+            "descartadas": model.lineas_descartadas,
+            "motivo": "filas impresas del formulario sin cantidad, precio ni importe",
+        }
     return {"header": header, "lines": lines, "observed": observed}
+
+
+_MESES_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+    7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre",
+    12: "diciembre",
+}
+
+
+def _fecha_observada(fecha_iso: str | None, ocr_text: str) -> bool:
+    """¿Aparece esa fecha escrita en el documento, en algún formato habitual?"""
+    if not fecha_iso:
+        return False
+    try:
+        anio, mes, dia = (int(parte) for parte in str(fecha_iso).split("-"))
+        mes_nombre = _MESES_ES[mes]
+    except (ValueError, KeyError):
+        return False
+    variantes: set[str] = set()
+    for sep in ("/", "-", ".", " "):
+        for dd, mm in ((f"{dia:02d}", f"{mes:02d}"), (str(dia), str(mes))):
+            variantes.add(f"{dd}{sep}{mm}{sep}{anio}")
+            variantes.add(f"{dd}{sep}{mm}{sep}{anio % 100:02d}")
+            variantes.add(f"{anio}{sep}{mm}{sep}{dd}")
+    variantes.update({
+        f"{dia} de {mes_nombre} de {anio}", f"{dia} de {mes_nombre}", f"{dia} {mes_nombre} {anio}",
+    })
+    plano = re.sub(r"\s+", "", ocr_text).lower()
+    return any(re.sub(r"\s+", "", v).lower() in plano for v in variantes)
+
+
+def _descartar_fecha_no_observada(model: AlbaranLLM, ocr_text: str) -> str | None:
+    """Vacía la fecha cuando no está escrita en el documento, y devuelve la descartada.
+
+    En un albarán manuscrito cuyo pie decía "de 6 de 202" (con el año cortado) el
+    modelo devolvió 06/01/2024: se inventó mes y año. Nadie lo detectaba, porque
+    el control de "esto no aparece en la foto" solo cubría base, IVA y total.
+
+    Una fecha equivocada no salta a la vista y sin embargo descuadra los informes
+    de gasto por meses, que es justo lo que se consulta por Telegram. Es mejor no
+    tener fecha y preguntarla —se responde mirando el papel, o es la de hoy— que
+    arrastrar un dato falso con apariencia de leído.
+    """
+    if not model.fecha or _fecha_observada(model.fecha, ocr_text):
+        return None
+    descartada = model.fecha
+    model.fecha = None
+    return descartada
+
+
+def _derivar_totales_en_modelo(model: AlbaranLLM, ocr_text: str = "") -> dict[str, Any] | None:
+    """Aplica la derivación de totales sobre el modelo antes de validarlo.
+
+    Devuelve la anotación de `decisiones` si hubo cálculo, para que el candidato
+    la conserve y la revisión pueda avisar de que el total lo pusimos nosotros.
+    """
+    header: dict[str, Any] = {
+        "base_imponible": model.base_imponible,
+        "total_iva": model.total_iva,
+        "total": model.total,
+    }
+    _derivar_totales_ausentes(
+        header, [{"importe_neto": linea.importe_neto} for linea in model.lineas], ocr_text
+    )
+    decision = (header.get("decisiones") or {}).get("totales")
+    if decision and decision.get("base_descartada") is not None:
+        # Si la base era inventada, el IVA que la acompaña lo es igual: en un
+        # albarán sin tabla de impuestos el modelo llegó a fabricar un tramo
+        # entero (21% sobre 1.138,46 = 216,31 €) sin que ninguna de esas cifras
+        # estuviera en el documento. Quedarse solo con la base calculada dejaba
+        # un híbrido peor que cualquiera de las dos versiones.
+        iva_inventado = model.total_iva is not None and not _amount_is_visible(
+            model.total_iva, ocr_text
+        )
+        tramos_inventados = all(
+            not _amount_is_visible(tramo.base, ocr_text)
+            and not _amount_is_visible(tramo.cuota, ocr_text)
+            for tramo in (model.detalle_iva or [])
+        )
+        if iva_inventado and tramos_inventados:
+            decision["iva_descartado"] = model.total_iva
+            model.total_iva = None
+            model.detalle_iva = None
+            header["total_iva"] = None
+            header["total"] = header.get("base_imponible")
+    model.base_imponible = header.get("base_imponible")
+    model.total = header.get("total")
+    return decision
+
+
+def _derivar_totales_ausentes(
+    header: dict[str, Any], lines: list[dict[str, Any]], ocr_text: str = "",
+) -> None:
+    """Calcula base y total cuando el albarán no los imprime, mutando la cabecera.
+
+    Hay albaranes que solo traen la tabla de productos y terminan sin totales.
+    Pedirle la suma al modelo daba un número distinto en cada pasada (un mismo
+    documento devolvió 1.183, 1.194, 1.197 y 1.034 € siendo 1.000,14 €), porque
+    sumar decenas de importes de cabeza no es algo que un LLM haga de forma
+    fiable. Aquí la suma es aritmética exacta y siempre da lo mismo.
+
+    Cubre dos casos:
+      - el modelo dejó los totales vacíos (lo que se le pide cuando no están
+        impresos): se rellenan con la suma;
+      - el modelo devolvió un total que NO aparece en el documento y que además
+        no coincide con la suma de las líneas: es una suma inventada, así que se
+        sustituye. El prompt se lo prohíbe, pero reincide de vez en cuando y un
+        total inventado corrompe la contabilidad en silencio.
+
+    Nunca toca un importe que sí esté impreso en el albarán: eso es un hecho, y
+    si no cuadra con las líneas debe verlo una persona, no taparlo el sistema.
+    """
+    importes = [line.get("importe_neto") for line in lines]
+    if not importes or any(importe is None for importe in importes):
+        return  # con una sola línea incompleta, la suma engañaría; mejor sin dato
+    base_declarada = header.get("base_imponible")
+    total_declarado = header.get("total")
+    base = round(sum(float(importe) for importe in importes), 2)
+
+    coincide_con_las_lineas = (
+        base_declarada is not None and abs(float(base_declarada) - base) <= 0.02
+    )
+    ninguna_visible = (
+        not _amount_is_visible(base_declarada, ocr_text)
+        and (total_declarado is None or not _amount_is_visible(total_declarado, ocr_text))
+    )
+    if base_declarada is None and total_declarado is None:
+        motivo = "el albarán no imprime base ni total"
+    elif base_declarada is not None and ninguna_visible and not coincide_con_las_lineas:
+        motivo = "el total no aparece en el documento y no cuadraba con las líneas"
+    elif base_declarada is not None and ninguna_visible and coincide_con_las_lineas:
+        # El número es correcto —es exactamente la suma de las líneas— pero NO
+        # está escrito en el papel: la casilla de totales viene en blanco y lo
+        # calculó el modelo. Antes esto se colaba como cifra impresa, porque solo
+        # se dejaba constancia cuando había que CAMBIAR el valor.
+        #
+        # Confundir "calculado por nosotros" con "impreso en el albarán" tiene
+        # consecuencias: al corregir después una línea, el total no se recalcula
+        # (creemos que es un hecho del papel) y el albarán se bloquea acusando al
+        # documento de declarar una cifra que nunca declaró.
+        header.setdefault("decisiones", {})["totales"] = {
+            "rule": "sumado-de-lineas",
+            "motivo": "el albarán no imprime los totales; la cifra coincide con la suma",
+            "base_calculada": base,
+            "total_calculado": header.get("total"),
+            "lineas_sumadas": len(importes),
+        }
+        return
+    else:
+        return
+
+    iva = header.get("total_iva")
+    total = round(base + float(iva), 2) if iva is not None else base
+    header["base_imponible"] = base
+    header["total"] = total
+    header.setdefault("decisiones", {})["totales"] = {
+        "rule": "sumado-de-lineas",
+        "motivo": motivo,
+        "base_descartada": base_declarada,
+        "base_calculada": base,
+        "total_calculado": total,
+        "lineas_sumadas": len(importes),
+    }
 
 
 def _provenance_issues(candidate: dict[str, Any]) -> list[ValidationIssue]:
@@ -454,6 +630,11 @@ def _amount_is_visible(value: Any, ocr_text: str) -> bool:
     variants = {
         f"{number:.2f}", f"{number:.2f}".replace(".", ","),
         f"{number:g}", f"{number:g}".replace(".", ","),
+        # Con separador de miles: "1000.14" se imprime "1.000,14" o "1,000.14".
+        # Sin estas variantes, un total impreso a partir de 1.000 € se marcaba
+        # como "no observado" y ensuciaba la revisión con un aviso falso.
+        f"{number:,.2f}", f"{number:,.2f}".replace(",", "."),
+        f"{number:,.2f}".translate(str.maketrans({",": ".", ".": ","})),
     }
     compact = ocr_text.replace(" ", "")
     return any(variant in compact for variant in variants)
@@ -471,7 +652,19 @@ def _header_provenance_issues(candidate: dict[str, Any], ocr_text: str) -> list[
             severity="warning", field="proveedor_nif",
             observed=nif_decision.get("observed"), expected=None,
         ))
+    totales = (header.get("decisiones") or {}).get("totales") or {}
+    if totales.get("rule") == "sumado-de-lineas":
+        # Sabemos con certeza que lo calculamos nosotros: se dice así, en vez de
+        # dejar el aviso genérico de "no aparece en el OCR", que suena a sospecha.
+        issues.append(ValidationIssue(
+            "totales_sumados_de_lineas",
+            "El albarán no trae totales impresos; se han sumado las líneas.",
+            severity="warning", field="total",
+            observed=None, expected=totales.get("total_calculado"),
+        ))
     for field in ("base_imponible", "total_iva", "total"):
+        if totales.get("rule") == "sumado-de-lineas" and field in ("base_imponible", "total"):
+            continue  # ya explicado arriba; no repetir el aviso genérico
         value = header.get(field)
         if value is not None and not _amount_is_visible(value, ocr_text):
             issues.append(ValidationIssue(
@@ -540,6 +733,7 @@ WARNING_REASONS = {
     "line_price_derived",
     "line_price_adjusted",
     "header_value_not_observed",
+    "totales_sumados_de_lineas",
     "supplier_tax_id_invalid",
 }
 
@@ -696,7 +890,16 @@ async def process_ingestion(ingestion_id: str, *, attempt: int = 1) -> Candidate
     model = AlbaranLLM.model_validate(raw)
     for line in model.lineas:
         _resolver_precio_neto(line)
-    candidate = _candidate_payload(model, observed)
+    # Antes de validar, no después: la validación mira el modelo, así que unos
+    # totales derivados solo en el candidato dejaban saltar "falta la base" y
+    # "falta el total" con los dos valores ya calculados delante.
+    _derivar_totales_en_modelo(model, ocr.text)
+    fecha_descartada = _descartar_fecha_no_observada(model, ocr.text)
+    candidate = _candidate_payload(model, observed, ocr.text)
+    if fecha_descartada:
+        candidate["header"].setdefault("decisiones", {})["fecha"] = {
+            "rule": "no-observada-en-el-documento", "descartada": fecha_descartada,
+        }
     report = validate_candidate(
         model,
         extraction_complete=extraction_complete,

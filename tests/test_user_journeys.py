@@ -115,7 +115,7 @@ async def test_revisar_y_corregir_comparten_todas_las_acciones(monkeypatch):
     )
     expected_labels = {
         "✅ Confirmar definitivamente", "Es duplicado", "No es duplicado",
-        "✍️ Introducir a mano", "🚫 Rechazar",
+        "✏️ Corregir un dato", "✍️ Introducir a mano", "🚫 Rechazar",
     }
 
     review_update = _update()

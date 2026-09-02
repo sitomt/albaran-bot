@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import supabase_client as db
 from .accounting_validation import validate_candidate
-from .albaran_processor import _parsear_numero
+from .albaran_processor import _normalizar_fecha, _parsear_numero
 from .spanish_tax_id import is_valid_spanish_tax_id
 from .ingestion_service import (
     PROMPT_VERSION,
@@ -80,6 +81,10 @@ _WARNING_LINE_TEMPLATES = {
     ),
 }
 _WARNING_DOCUMENT_FRIENDLY = {
+    "totales_sumados_de_lineas": (
+        "Este albarán no trae el total escrito, así que lo hemos sumado nosotros "
+        "a partir de las líneas. Comprueba que te cuadra."
+    ),
     "human_confirmation_required": "Solo falta tu confirmación como responsable; no hemos detectado ningún error.",
     "handwritten_document": (
         "El documento tiene texto escrito a mano; lo hemos leído, pero conviene que "
@@ -98,6 +103,71 @@ _WARNING_DOCUMENT_FRIENDLY = {
         "guardado. Puedes añadirlo a mano si lo necesitas."
     ),
 }
+
+
+_CIFRAS_DE_LINEA = {"cantidad", "precio_unitario", "importe_neto"}
+
+
+def _lineas_corregidas_a_mano(candidate: dict[str, Any]) -> list[str]:
+    """Nombres de los productos cuyas cifras ha tocado una persona."""
+    nombres = []
+    for linea in candidate.get("lines") or []:
+        decisiones = linea.get("decisiones") or {}
+        if any(
+            campo in _CIFRAS_DE_LINEA and isinstance(detalle, dict)
+            and detalle.get("source") == "human_correction"
+            for campo, detalle in decisiones.items()
+        ):
+            nombres.append(str(linea.get("descripcion_limpia") or "una línea"))
+    return nombres
+
+
+def _explicacion_descuadre(item: dict, corregidas: list[str] | None = None) -> str | None:
+    """Explica un descuadre de totales por la DIFERENCIA, no por el valor a copiar.
+
+    "observado 316,22 → propuesto 314,97" empuja a sustituir la base por la suma
+    de líneas, y eso borra cargos legítimos que el albarán cobra aparte (portes,
+    envases, un P.V.). Lo que la persona necesita saber es cuánto falta y de qué
+    puede ser, para decidir con la foto delante.
+    """
+    reason = str(item.get("reason_code") or "")
+    if reason not in {"base_lines_mismatch", "document_total_mismatch"}:
+        return None
+    try:
+        observado = float(item.get("observed_value"))
+        calculado = float(item.get("calculated_value"))
+    except (TypeError, ValueError):
+        return None
+    diferencia = round(observado - calculado, 2)
+    if reason == "base_lines_mismatch" and corregidas:
+        # El descuadre lo ha abierto la corrección que acaban de hacer, no el
+        # OCR. Hablar aquí de "portes o envases" mandaría a inventar un cargo
+        # que no existe: lo que hay que mirar es el otro número de esa línea.
+        return (
+            f"Al corregir {', '.join(f'«{nombre}»' for nombre in corregidas[:2])} "
+            f"los productos pasan a sumar {_number(calculado)}€, y el albarán "
+            f"declara {_number(observado)}€ de base: bailan {_number(abs(diferencia))}€. "
+            "Si la cantidad nueva es la buena, entonces el precio o el total "
+            "también están mal leídos: compruébalos en la foto."
+        )
+    if reason == "base_lines_mismatch":
+        if diferencia > 0:
+            return (
+                f"La base del albarán ({_number(observado)}€) es {_number(abs(diferencia))}€ "
+                f"mayor que la suma de los productos ({_number(calculado)}€). "
+                "Suele ser un cargo aparte (portes, envases, retornos). "
+                "Mira la foto: si ese cargo está, el albarán es correcto."
+            )
+        return (
+            f"Los productos suman {_number(calculado)}€, pero la base del albarán es "
+            f"{_number(observado)}€, o sea {_number(abs(diferencia))}€ menos. "
+            "Puede que sobre una línea o que alguna esté repetida."
+        )
+    return (
+        f"El total del albarán ({_number(observado)}€) no cuadra con base + IVA "
+        f"({_number(calculado)}€); bailan {_number(abs(diferencia))}€. "
+        "Comprueba en la foto el total y los tramos de IVA."
+    )
 
 
 def _friendly_warning_sentences(reviews: list[dict], lines: list[dict]) -> list[str]:
@@ -167,6 +237,7 @@ REASON_LABELS = {
     "line_price_derived": "El neto se calculó desde tarifa y descuento",
     "line_price_adjusted": "El precio neto aceptado difiere del leído",
     "header_value_not_observed": "La cifra no aparece literal y puede ser una suma calculada",
+    "totales_sumados_de_lineas": "El albarán no trae totales impresos; se sumaron las líneas",
     "supplier_tax_id_invalid": "El NIF/CIF leído no supera el dígito de control",
     "human_confirmation_required": "Falta la confirmación de un propietario",
     "probable_duplicate": "Hay otro albarán parecido que debes comparar",
@@ -267,6 +338,11 @@ class ReviewView:
     probable_duplicate: bool
     candidate_artifact_id: str = ""
     candidate: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    open_reviews: list[dict[str, Any]] = field(default_factory=list, repr=False, compare=False)
+    # Qué se acaba de cambiar, en una frase. Decir solo "corregido" obliga a
+    # releer todo el albarán para comprobar que se tocó lo que se quería tocar,
+    # y esconde lo que el cambio arrastró (el importe recalculado, por ejemplo).
+    ultimo_cambio: str = ""
 
 
 def _correction_hint(reference: str, reviews: list[dict], hard_reasons: set[str]) -> str | None:
@@ -307,8 +383,7 @@ async def build_review_view(ingestion_id: str, user_id: int) -> ReviewView:
         f"{header.get('proveedor_nombre') or 'Proveedor desconocido'} | {header.get('fecha') or 'sin fecha'}",
         f"Nº {header.get('numero_albaran') or '—'}",
         _tax_id_summary(header),
-        f"Base {_number(header.get('base_imponible'))}€ + IVA {_number(header.get('total_iva'))}€ "
-        f"= TOTAL {_number(header.get('total'))}€",
+        _resumen_importes(header),
     ]
     if can_approve and reviews:
         text.extend(["", "✅ Todo cuadra, no tienes que corregir nada."])
@@ -346,6 +421,10 @@ async def build_review_view(ingestion_id: str, user_id: int) -> ReviewView:
         for item in reviews[:12]:
             if str(item.get("reason_code")) not in hard_reasons:
                 continue
+            explicacion = _explicacion_descuadre(item, _lineas_corregidas_a_mano(candidate))
+            if explicacion:
+                text.append(f"• {explicacion}")
+                continue
             detail = ""
             observed = item.get("observed_value")
             calculated = item.get("calculated_value")
@@ -366,10 +445,26 @@ async def build_review_view(ingestion_id: str, user_id: int) -> ReviewView:
             text.append(f"• {REASON_LABELS.get(reason, reason)}{location}{detail}")
         if len(reviews) > 12:
             text.append(f"• y {len(reviews) - 12} comprobaciones más")
-        text.extend(["", "Hay diferencias que impiden confirmar."])
+        # El encabezado de arriba ya dice que no se puede confirmar; repetirlo aquí
+        # solo añadía alarma. Y si hay un botón que lo arregla de un toque, el
+        # comando con su sintaxis sobra: se ofrece solo como alternativa escrita.
+        atajos = _acciones_para(reviews, candidate)
         hint = _correction_hint(ingestion_id[:8], reviews, hard_reasons)
-        if hint:
-            text.extend(["Corrige el campo indicado sustituyendo VALOR_CORRECTO:", hint])
+        if atajos:
+            botones = " o ".join(f"«{texto}»" for texto, _ in atajos)
+            text.extend(["", f"Puedes resolverlo con el botón {botones} de abajo."])
+            if hint:
+                text.append(f"O a mano: {hint}")
+        elif hint:
+            # El comando exacto queda como alternativa para quien lo prefiera,
+            # pero lo primero que se lee es el botón: nadie debería tener que
+            # aprenderse un nombre de campo para arreglar una cifra mal leída.
+            text.extend([
+                "",
+                "Pulsa «✏️ Corregir un dato» y elige qué está mal; el bot te "
+                "pregunta y tú respondes solo con el dato.",
+                f"O a mano: {hint}",
+            ])
         if hard_reasons & _NON_EDITABLE_REASONS or not hint:
             text.append(
                 "Si faltan líneas o la foto no se entiende, reintenta el OCR o usa "
@@ -394,6 +489,7 @@ async def build_review_view(ingestion_id: str, user_id: int) -> ReviewView:
         ingestion_id, "\n".join(text), can_approve,
         probable_duplicate="probable_duplicate" in reasons,
         candidate_artifact_id=artifact_id, candidate=candidate,
+        open_reviews=reviews,
     )
 
 
@@ -440,7 +536,461 @@ async def reject_ingestion(
     )
 
 
+_ALTA_LINEA = {"añadir", "anadir", "añade", "agregar", "add"}
+_BAJA_LINEA = {"borrar", "eliminar", "quitar", "borra"}
+_CARGO = {"cargo", "portes", "envases"}
+CARGO_SIN_IDENTIFICAR = "Cargo sin identificar"
+
+
+def _nueva_linea(nombre: str, cantidad: float, precio: float, user_id: int) -> dict[str, Any]:
+    """Construye una línea con la misma forma que las del OCR, marcada como humana."""
+    return {
+        "descripcion_limpia": nombre,
+        "descripcion_original": nombre,
+        "nombre_producto": nombre,
+        "cantidad": cantidad,
+        "unidad": "ud",
+        "precio_unitario": precio,
+        "importe_neto": round(cantidad * precio, 2),
+        "descuento_pct": None,
+        "confianza": 100,
+        "valores_observados": {},
+        "valores_calculados": {"importe_resuelto": round(cantidad * precio, 2)},
+        "decisiones": {
+            "rule": "linea-anadida-a-mano",
+            "source": "human_correction",
+            "actor": str(user_id),
+        },
+    }
+
+
+def _hueco_de_la_base(candidate: dict[str, Any]) -> float:
+    """Diferencia entre la base declarada y lo que suman las líneas."""
+    header = candidate.get("header") or {}
+    base = header.get("base_imponible")
+    if base is None:
+        return 0.0
+    importes = [linea.get("importe_neto") for linea in candidate.get("lines") or []]
+    if any(importe is None for importe in importes):
+        return 0.0
+    return round(float(base) - sum(float(importe) for importe in importes), 2)
+
+
+def _añadir_linea(candidate: dict[str, Any], args: list[str], user_id: int) -> str:
+    """`añadir Tomate, 12, 1,81` — mete un producto que el OCR no vio."""
+    from .manual_albaran import _parsear_producto
+
+    texto = " ".join(args).strip()
+    parsed = _parsear_producto(texto)
+    if parsed is None:
+        raise ValueError(
+            "Escribe el producto así: añadir NOMBRE, CANTIDAD, PRECIO\n"
+            "Por ejemplo: añadir Tomate frito, 3, 8,70"
+        )
+    nombre, cantidad, precio = parsed
+    candidate["lines"].append(_nueva_linea(nombre, cantidad, precio, user_id))
+    return f"línea añadida ({nombre})"
+
+
+def _borrar_linea(candidate: dict[str, Any], args: list[str]) -> str:
+    """`borrar linea 3` — quita una línea que el OCR duplicó o inventó."""
+    numeros = [a for a in args if a.isdigit()]
+    if not numeros:
+        raise ValueError("Indica cuál: borrar linea 3")
+    index = int(numeros[0]) - 1
+    lineas = candidate["lines"]
+    if index < 0 or index >= len(lineas):
+        raise ValueError(f"Ese albarán tiene {len(lineas)} líneas; no existe la {index + 1}")
+    if len(lineas) == 1:
+        raise ValueError("No puedo dejar el albarán sin ninguna línea")
+    eliminada = lineas.pop(index)
+    return f"línea {index + 1} borrada ({eliminada.get('descripcion_limpia') or 'sin nombre'})"
+
+
+def _añadir_cargo(candidate: dict[str, Any], args: list[str], user_id: int) -> str:
+    """Materializa como línea el dinero que falta para cuadrar con la base.
+
+    Cuando la base del albarán supera a la suma de los productos y nadie sabe de
+    qué es ese dinero (un porte, unos envases, un cargo manuscrito ilegible), la
+    alternativa era bloquear el albarán o falsear la base. Ninguna sirve: la
+    primera deja fuera gasto real y la segunda corrompe el total.
+
+    Dándole cuerpo de línea, la contabilidad vuelve a cuadrar sin tocar ni un
+    número leído, el importe desconocido queda a la vista con nombre propio y se
+    puede identificar más adelante. Es lo que haría un contable: no se tapa un
+    descuadre, se le pone una etiqueta.
+    """
+    hueco = _hueco_de_la_base(candidate)
+    importe = _parsear_numero(" ".join(args[1:])) if len(args) > 1 else hueco
+    if importe is None or importe <= 0:
+        if len(args) <= 1:
+            raise ValueError(
+                "Las cuentas ya cuadran: los productos suman exactamente la base "
+                "del albarán, así que no hace falta ningún cargo."
+            )
+        raise ValueError("Necesito el importe del cargo, por ejemplo: cargo 1,25")
+    nombre = CARGO_SIN_IDENTIFICAR
+    candidate["lines"].append({
+        **_nueva_linea(nombre, 1.0, round(float(importe), 2), user_id),
+        "decisiones": {
+            "rule": "cargo-sin-identificar",
+            "source": "human_correction",
+            "actor": str(user_id),
+            "motivo": "la base del albarán no la cubren los productos leídos",
+        },
+    })
+    return f"cargo de {_euros(importe)} añadido"
+
+
+def _decimal(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _recalcular_linea(linea: dict[str, Any], campo: str) -> str | None:
+    """Mantiene cantidad × precio = importe después de corregir uno de los tres.
+
+    Corregir "15,9 kg" por "15,4 kg" y dejar el importe en 43,73 € no arregla
+    nada: deja la línea contradiciéndose consigo misma y el albarán bloqueado por
+    un descuadre nuevo, provocado por la propia corrección. Quien mira el papel
+    corrige el dato que ve mal, no espera tener que recalcular a mano lo que
+    depende de él.
+    """
+    cantidad = _decimal(linea.get("cantidad"))
+    precio = _decimal(linea.get("precio_unitario"))
+    importe = _decimal(linea.get("importe_neto"))
+    if campo in {"cantidad", "precio_unitario"} and cantidad is not None and precio is not None:
+        nuevo = round(cantidad * precio, 2)
+        if importe is None or abs(nuevo - importe) > 0.005:
+            linea["importe_neto"] = nuevo
+            linea.setdefault("valores_calculados", {})["importe_resuelto"] = nuevo
+            return f"el importe pasa de {_euros(importe)} a {_euros(nuevo)}"
+    if campo == "importe_neto" and cantidad and importe is not None:
+        nuevo = round(importe / cantidad, 4)
+        if precio is None or abs(nuevo - precio) > 0.0005:
+            linea["precio_unitario"] = nuevo
+            linea.setdefault("valores_calculados", {})["precio_neto_resuelto"] = nuevo
+            return f"el precio pasa a {_number(nuevo, 4)}€/u"
+    return None
+
+
+def _recalcular_totales_derivados(candidate: dict[str, Any]) -> str | None:
+    """Rehace base y total SOLO si los habíamos calculado nosotros sumando líneas.
+
+    Un importe impreso en el papel es un hecho y no se toca: si tras la
+    corrección deja de cuadrar con las líneas, eso es justo lo que una persona
+    tiene que ver, no algo que el sistema deba tapar recalculando.
+    """
+    header = candidate.get("header") or {}
+    decision = (header.get("decisiones") or {}).get("totales") or {}
+    if decision.get("rule") != "sumado-de-lineas":
+        return None
+    importes = [_decimal(linea.get("importe_neto")) for linea in candidate.get("lines") or []]
+    if not importes or any(importe is None for importe in importes):
+        return None
+    base = round(sum(importes), 2)
+    iva = _decimal(header.get("total_iva"))
+    total = round(base + iva, 2) if iva is not None else base
+    if base == _decimal(header.get("base_imponible")) and total == _decimal(header.get("total")):
+        return None
+    header["base_imponible"] = base
+    header["total"] = total
+    decision.update({"base_calculada": base, "total_calculado": total})
+    return f"la base y el total pasan a {_euros(base)} y {_euros(total)}"
+
+
+def _igualar_base_y_total_sin_iva(
+    header: dict[str, Any], campo: str, anterior: Any,
+) -> str | None:
+    """En un albarán sin IVA, base y total son por definición el mismo número.
+
+    Corregir uno y dejar el otro con el valor viejo transforma un descuadre en
+    dos y obliga a escribir dos veces la misma cifra.
+    """
+    if campo not in {"base_imponible", "total"} or header.get("total_iva"):
+        return None
+    otro = "total" if campo == "base_imponible" else "base_imponible"
+    # Solo si ya iban de la mano: si el papel traía dos cifras distintas, esa
+    # diferencia es un dato del documento y no nos toca a nosotros borrarla.
+    if header.get(otro) != anterior:
+        return None
+    header[otro] = header[campo]
+    return f"base y total quedan igualados en {_euros(header[campo])}"
+
+
+def _euros(valor: Any) -> str:
+    """Importe con dos decimales para mensajes de dinero ("6,00€", no "6€")."""
+    try:
+        return f"{float(valor):.2f}".replace(".", ",") + "€"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _resumen_importes(header: dict[str, Any]) -> str:
+    """Línea de totales; omite el IVA cuando el albarán no repercute ninguno."""
+    base = header.get("base_imponible")
+    iva = header.get("total_iva")
+    total = header.get("total")
+    if not iva:
+        return f"Base {_number(base)}€ = TOTAL {_number(total)}€ (sin IVA)"
+    return f"Base {_number(base)}€ + IVA {_number(iva)}€ = TOTAL {_number(total)}€"
+
+
+# ── Corrección guiada de un dato suelto ──────────────────────────────────────
+# Corregir una cifra mal leída era, con diferencia, lo que más se hace y lo más
+# incómodo de hacer: había que localizar la referencia del documento, saber el
+# nombre interno del campo y escribir /corregir con la sintaxis exacta. Todo eso
+# es trabajo de ordenador, no de la persona que tiene el albarán en la mano.
+#
+# Lo que sigue prepara el material para preguntarlo a botones: qué se puede
+# corregir, cuánto vale ahora cada cosa y qué frase usar para pedir el valor
+# nuevo. El bot solo tiene que pintar botones y esperar un número suelto.
+
+_ETIQUETA_CAMPO = {
+    "cantidad": "cantidad",
+    "precio_unitario": "precio",
+    "importe_neto": "importe",
+    "descripcion_limpia": "nombre",
+    "unidad": "unidad",
+    "descuento_pct": "descuento",
+    "fecha": "fecha",
+    "numero_albaran": "nº de albarán",
+    "proveedor_nombre": "proveedor",
+    "proveedor_nif": "NIF/CIF",
+    "base_imponible": "base imponible",
+    "total_iva": "IVA",
+    "total": "total",
+}
+
+# Orden de aparición en el teclado: primero lo que casi siempre falla al leer
+# números escritos a mano, y el nombre al final porque casi nunca se toca.
+_CAMPOS_DE_LINEA = ("cantidad", "precio", "importe", "nombre")
+_CAMPOS_DE_CABECERA = ("fecha", "numero", "proveedor", "total", "base", "iva")
+
+
+def _formatear_valor(valor: Any) -> str:
+    if valor in (None, ""):
+        return "vacío"
+    if isinstance(valor, (int, float)):
+        return _number(valor, 4)
+    return str(valor)
+
+
+def _linea_numero(candidate: dict[str, Any], numero: int) -> dict[str, Any] | None:
+    lineas = candidate.get("lines") or []
+    return lineas[numero - 1] if 1 <= numero <= len(lineas) else None
+
+
+def valor_actual(candidate: dict[str, Any], destino: list[str]) -> str:
+    """Cómo se ve hoy el dato al que apunta `destino`, con su unidad o su €."""
+    if destino and destino[0] == "linea":
+        linea = _linea_numero(candidate, int(destino[1]))
+        if linea is None:
+            return "—"
+        campo = destino[2]
+        if campo == "cantidad":
+            return f"{_number(linea.get('cantidad'), 3)} {linea.get('unidad') or 'ud'}"
+        if campo == "precio":
+            return f"{_number(linea.get('precio_unitario'), 4)}€"
+        if campo == "importe":
+            return f"{_number(linea.get('importe_neto'))}€"
+        if campo == "nombre":
+            return str(linea.get("descripcion_limpia") or "—")
+        return "—"
+    header = candidate.get("header") or {}
+    campo = destino[0] if destino else ""
+    if campo == "fecha":
+        return str(header.get("fecha") or "—")
+    if campo == "numero":
+        return str(header.get("numero_albaran") or "—")
+    if campo == "proveedor":
+        return str(header.get("proveedor_nombre") or "—")
+    valor = header.get(HEADER_FIELDS.get(campo, ""))
+    return f"{_number(valor)}€" if valor is not None else "—"
+
+
+def _acortar(texto: str, limite: int = 22) -> str:
+    """Telegram recorta los botones largos por su cuenta y sin avisar; mejor
+    recortar nosotros con "…" para que se vea que el texto sigue."""
+    texto = str(texto)
+    return texto if len(texto) <= limite else texto[:limite - 1].rstrip() + "…"
+
+
+def lineas_corregibles(view: "ReviewView") -> list[tuple[int, str]]:
+    """(número de línea, etiqueta corta para el botón)."""
+    return [
+        (numero, f"{numero}. {_acortar(linea.get('descripcion_limpia') or 'Sin nombre')}")
+        for numero, linea in enumerate(view.candidate.get("lines") or [], start=1)
+    ]
+
+
+def campos_de_linea(view: "ReviewView", numero: int) -> list[tuple[list[str], str]]:
+    """(destino para /corregir, etiqueta con el valor que tiene ahora)."""
+    linea = _linea_numero(view.candidate, numero)
+    if linea is None:
+        raise ValueError("Esa línea ya no existe")
+    opciones = []
+    for campo in _CAMPOS_DE_LINEA:
+        destino = ["linea", str(numero), campo]
+        opciones.append((destino, f"{campo.capitalize()}: {valor_actual(view.candidate, destino)}"))
+    return opciones
+
+
+def campos_de_cabecera(view: "ReviewView") -> list[tuple[list[str], str]]:
+    etiquetas = {
+        "fecha": "Fecha", "numero": "Nº albarán", "proveedor": "Proveedor",
+        "total": "Total", "base": "Base", "iva": "IVA",
+    }
+    return [
+        ([campo], f"{etiquetas[campo]}: {_acortar(valor_actual(view.candidate, [campo]), 28)}")
+        for campo in _CAMPOS_DE_CABECERA
+    ]
+
+
+def titulo_de_linea(view: "ReviewView", numero: int) -> str:
+    linea = _linea_numero(view.candidate, numero)
+    if linea is None:
+        raise ValueError("Esa línea ya no existe")
+    return _line_summary(numero, linea)
+
+
+def pregunta_de_correccion(view: "ReviewView", destino: list[str]) -> str:
+    """La frase que se manda al pedir el valor nuevo.
+
+    Dice siempre qué hay ahora, para que se pueda comparar con el papel sin
+    volver atrás, y pone un ejemplo del formato para que nadie dude de si los
+    decimales van con coma o con punto.
+    """
+    actual = valor_actual(view.candidate, destino)
+    if destino[0] == "linea":
+        linea = _linea_numero(view.candidate, int(destino[1]))
+        nombre = str((linea or {}).get("descripcion_limpia") or f"línea {destino[1]}")
+        campo = destino[2]
+        preguntas = {
+            "cantidad": f"¿Qué cantidad pone en el albarán para «{nombre}»?",
+            "precio": f"¿Qué precio por unidad pone para «{nombre}»?",
+            "importe": f"¿Qué importe pone en la línea de «{nombre}»?",
+            "nombre": "¿Cómo se llama ese producto?",
+        }
+        ejemplo = "Sardina" if campo == "nombre" else "15,4"
+        return (
+            f"{preguntas[campo]}\n"
+            f"Ahora tengo: {actual}\n\n"
+            f"Responde solo con el dato, por ejemplo: {ejemplo}"
+        )
+    preguntas = {
+        "fecha": "¿Qué fecha pone el albarán?",
+        "numero": "¿Qué número de albarán pone?",
+        "proveedor": "¿Cómo se llama el proveedor?",
+        "total": "¿Qué total pone el albarán?",
+        "base": "¿Qué base imponible pone?",
+        "iva": "¿Qué IVA pone?",
+    }
+    ejemplos = {
+        "fecha": "02/09/2026", "numero": "0734079", "proveedor": "Matadero INTESA",
+        "total": "133,67", "base": "133,67", "iva": "13,37",
+    }
+    return (
+        f"{preguntas[destino[0]]}\n"
+        f"Ahora tengo: {actual}\n\n"
+        f"Responde solo con el dato, por ejemplo: {ejemplos[destino[0]]}"
+    )
+
+
+# Descuadres que delatan que las cifras del pie no son de fiar. Con cualquiera de
+# ellos presente no sabemos qué número está mal, así que no se ofrece el cargo:
+# convertir el hueco en una línea fosilizaría una mala lectura en vez de arreglarla.
+_CIFRAS_DE_CABECERA_DUDOSAS = {
+    "vat_quota_mismatch", "vat_bases_mismatch", "vat_total_mismatch",
+    "vat_detail_invalid", "document_total_mismatch",
+}
+
+
+def _acciones_para(reviews: list[dict], candidate: dict[str, Any]) -> list[tuple[str, str]]:
+    if not candidate:
+        return []
+    acciones: list[tuple[str, str]] = []
+    motivos = {str(item.get("reason_code")) for item in reviews}
+    if "date_invalid" in motivos:
+        acciones.append(("📅 Es de hoy", "hoy"))
+    if (
+        "base_lines_mismatch" in motivos
+        and not (motivos & _CIFRAS_DE_CABECERA_DUDOSAS)
+        # Si el hueco lo abrió una corrección a mano, no es un cargo que falte:
+        # es que otra cifra de esa misma línea sigue mal leída. Convertirlo en
+        # "Cargo sin identificar" fosilizaría el error en la contabilidad.
+        and not _lineas_corregidas_a_mano(candidate)
+    ):
+        # Un albarán manuscrito declaraba "TOTAL BRUTO 427,0" con sus dos líneas
+        # sumando 421,00: parecía faltar un cargo de 6 €, pero el pie tampoco
+        # cuadraba consigo mismo (427 + 47,10 ≠ 463,10). Era un 421 mal leído.
+        hueco = _hueco_de_la_base(candidate)
+        if hueco > 0:
+            acciones.append((f"➕ Cargo de {_euros(hueco)}", "cargo"))
+    return acciones
+
+
+def atajos_de_correccion(view: "ReviewView") -> list[tuple[str, list[str]]]:
+    """Accesos directos al dato que casi seguro sigue mal, sin pasar por el menú.
+
+    Cuando alguien corrige la cantidad de un producto y con eso el albarán deja
+    de cuadrar, solo hay dos culpables posibles: el precio de esa misma línea o
+    el total del papel. Hacerle recorrer otra vez menú → producto → campo para
+    llegar a uno de los dos es trabajo inútil, y encima esconde cuáles son las
+    dos opciones reales.
+    """
+    motivos = {str(item.get("reason_code")) for item in view.open_reviews}
+    if "base_lines_mismatch" not in motivos:
+        return []
+    atajos: list[tuple[str, list[str]]] = []
+    for numero, linea in enumerate(view.candidate.get("lines") or [], start=1):
+        decisiones = linea.get("decisiones") or {}
+        tocados = {
+            campo for campo, detalle in decisiones.items()
+            if campo in _CIFRAS_DE_LINEA and isinstance(detalle, dict)
+            and detalle.get("source") == "human_correction"
+        }
+        if not tocados:
+            continue
+        nombre = _acortar(linea.get("descripcion_limpia") or f"línea {numero}", 16)
+        # Se ofrece la otra cifra de la línea, no la que se acaba de tocar.
+        campo = "importe" if "precio_unitario" in tocados else "precio"
+        etiqueta = "Importe" if campo == "importe" else "Precio"
+        atajos.append((f"✏️ {etiqueta} de {nombre}", ["linea", str(numero), campo]))
+    if atajos:
+        # Sin IVA da igual cuál se toque (se igualan solos) y "total" es lo que
+        # la gente busca en el papel; con IVA hay que apuntar a la base, que es
+        # la cifra concreta que no cuadra con las líneas.
+        sin_iva = not (view.candidate.get("header") or {}).get("total_iva")
+        atajos.append(
+            ("✏️ Total del albarán", ["total"]) if sin_iva
+            else ("✏️ Base del albarán", ["base"])
+        )
+    return atajos[:3]
+
+
+def acciones_sugeridas(view: "ReviewView") -> list[tuple[str, str]]:
+    """Arreglos de un toque para lo que bloquea este albarán.
+
+    Devuelve pares (texto del botón, acción). La idea es que la persona no tenga
+    que deducir qué campo tocar ni redactar un comando: si lo que falta tiene una
+    respuesta evidente, se ofrece hecha y basta con confirmarla.
+    """
+    return _acciones_para(view.open_reviews, view.candidate)
+
+
 def _set_correction(candidate: dict[str, Any], args: list[str], user_id: int) -> str:
+    if not args:
+        raise ValueError("Falta campo o valor")
+    accion = args[0].lower()
+    if accion in _ALTA_LINEA:
+        return _añadir_linea(candidate, args[1:], user_id)
+    if accion in _BAJA_LINEA:
+        return _borrar_linea(candidate, args[1:])
+    if accion in _CARGO:
+        return _añadir_cargo(candidate, args, user_id)
     if len(args) < 2:
         raise ValueError("Falta campo o valor")
     if args[0].lower() == "linea":
@@ -454,18 +1004,29 @@ def _set_correction(candidate: dict[str, Any], args: list[str], user_id: int) ->
             raise ValueError("Campo de línea no permitido")
         raw_value = " ".join(args[3:]).strip()
         target = candidate["lines"][index]
-        label = f"línea {index + 1} {field}"
+        nombre = target.get("descripcion_limpia") or f"línea {index + 1}"
+        label = f"«{nombre}» · {_ETIQUETA_CAMPO.get(field, field)}"
     else:
         field = HEADER_FIELDS.get(args[0].lower())
         if not field:
             raise ValueError("Campo de cabecera no permitido")
         raw_value = " ".join(args[1:]).strip()
         target = candidate["header"]
-        label = field
+        label = _ETIQUETA_CAMPO.get(field, field)
     if field in NUMERIC_FIELDS:
         value = _parsear_numero(raw_value)
         if value is None or value < 0:
-            raise ValueError("El valor numérico no es válido")
+            raise ValueError(
+                "Eso no me parece un número. Escribe solo la cifra, "
+                "con coma para los decimales: 15,4"
+            )
+    elif field == "fecha":
+        # La validación contable exige ISO (date.fromisoformat). Guardar aquí el
+        # texto tal cual hacía que corregir la fecha no sirviera de nada: se
+        # aceptaba "02/09/2026" y el albarán seguía marcado como fecha inválida.
+        value = _normalizar_fecha(raw_value)
+        if value is None:
+            raise ValueError("No entiendo esa fecha. Escríbela así: 02/09/2026")
     else:
         value = raw_value[:200]
         if not value:
@@ -480,19 +1041,48 @@ def _set_correction(candidate: dict[str, Any], args: list[str], user_id: int) ->
             "previous": previous, "observed": previous, "accepted": value,
             "rule": "human-validated",
         }
+    consecuencias: list[str] = []
+    if target is candidate["header"]:
+        nota_sin_iva = _igualar_base_y_total_sin_iva(target, field, previous)
+        if nota_sin_iva:
+            consecuencias.append(nota_sin_iva)
     if target is not candidate["header"]:
         decisions = target.setdefault("decisiones", {})
         decisions[field] = {
             "source": "human_correction", "actor": str(user_id),
             "previous": previous, "accepted": value,
         }
-    return label
+        nota = _recalcular_linea(target, field)
+        if nota:
+            consecuencias.append(nota)
+    nota_totales = _recalcular_totales_derivados(candidate)
+    if nota_totales:
+        consecuencias.append(nota_totales)
+    resumen = f"{label}: {_formatear_valor(previous)} → {_formatear_valor(value)}"
+    resumen = resumen[0].upper() + resumen[1:]
+    if consecuencias:
+        resumen += f" ({'; '.join(consecuencias)})"
+    return resumen
+
+
+# Estados desde los que corregir el candidato ya no tiene sentido: el albarán
+# está cerrado y sus líneas viven en `albaranes`/`lineas_albaran`, no en el
+# candidato. Editar aquí dejaría la ingesta abierta otra vez con una versión
+# nueva que jamás podrá confirmarse (la clave de idempotencia ya está usada con
+# otro contenido), y mientras tanto la contabilidad seguiría con los datos
+# viejos. Es preferible decirlo que corromperlo en silencio.
+_ESTADOS_CERRADOS = {"confirmed", "rejected", "archived"}
 
 
 async def correct_candidate(reference: str, user_id: int, correction_args: list[str]) -> ReviewView:
     ingestion = await db.buscar_ingestion_por_referencia(reference, user_id)
     if not ingestion:
         raise ValueError("Referencia no encontrada o ambigua")
+    if str(ingestion.get("status")) in _ESTADOS_CERRADOS:
+        raise ValueError(
+            "Ese albarán ya está cerrado y no se puede corregir desde aquí. "
+            f"Archívalo con «/anular {reference} motivo» y vuelve a subir la foto."
+        )
     ingestion_id = ingestion["id"]
     candidate, _ = await load_candidate(ingestion_id)
     revised = copy.deepcopy(candidate)
@@ -535,4 +1125,6 @@ async def correct_candidate(reference: str, user_id: int, correction_args: list[
         "candidate.corrected", ingestion_id=ingestion_id,
         actor_type="telegram_user", actor_id=str(user_id), data={"field": changed_label},
     )
-    return await build_review_view(ingestion_id, user_id)
+    return dataclasses.replace(
+        await build_review_view(ingestion_id, user_id), ultimo_cambio=changed_label
+    )

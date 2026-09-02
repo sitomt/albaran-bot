@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from .config import settings
 
@@ -131,6 +131,14 @@ class AlbaranLLM(BaseModel):
     total: float | None = None
     detalle_iva: list[DetalleIvaLLM] | None = None
     lineas: list[LineaAlbaranLLM]
+    # No lo rellena el LLM: lo cuenta el filtro de filas de catálogo, para poder
+    # decir cuántas se descartaron en vez de hacerlo en silencio.
+    lineas_descartadas: int = 0
+    # Posición que ocupaba cada línea superviviente en la lista original del
+    # LLM. Sin esto, al descartar filas de catálogo el candidato emparejaba
+    # cada línea con los `valores_observados` de otra: el desfase colocaba la
+    # tarifa de un producto bajo el nombre del siguiente.
+    indices_conservados: list[int] = []
 
     @field_validator("fecha", mode="before")
     @classmethod
@@ -141,6 +149,70 @@ class AlbaranLLM(BaseModel):
     @classmethod
     def limpiar_importe(cls, v: Any) -> float | None:
         return _parsear_numero(v)
+
+    @model_validator(mode="after")
+    def descartar_filas_de_catalogo(self) -> "AlbaranLLM":
+        """Elimina las filas impresas del catálogo que el proveedor no sirvió.
+
+        Muchos albaranes de hostelería son formularios preimpresos con TODOS los
+        artículos que vende el proveedor; el repartidor solo rellena a mano los
+        que trae. El OCR devuelve la plantilla entera, así que un albarán de 4
+        productos llegaba con 21 líneas y 17 de ellas sin un solo número.
+
+        Cada fila vacía generaba sus propios errores (cantidad inválida, precio
+        inválido, importe inválido) e impedía además calcular el total, porque
+        no se puede sumar una lista con huecos. Resultado: el albarán se daba
+        por ilegible y había que teclearlo entero, teniendo sus 4 productos
+        perfectamente leídos.
+
+        Criterio deliberadamente conservador: se descarta una fila SOLO si no
+        tiene cantidad, ni precio (de ningún tipo), ni importe. Sin un solo dato
+        económico no puede ser una entrega real, y tampoco habría nada que
+        validar. Basta un número para que la línea se conserve y se revise.
+        """
+        indices = [
+            posicion for posicion, linea in enumerate(self.lineas)
+            if linea.cantidad is not None
+            or linea.importe_neto is not None
+            or linea.precio_unitario is not None
+            or linea.precio_tarifa is not None
+            or linea.precio_neto is not None
+        ]
+        conservadas = [self.lineas[posicion] for posicion in indices]
+        # Si NINGUNA línea tiene datos no es una plantilla: es un documento que
+        # no se ha podido leer. Vaciarlo escondería el problema, así que se deja
+        # tal cual para que la validación lo marque y se ofrezca la entrada manual.
+        if conservadas and len(conservadas) != len(self.lineas):
+            self.lineas_descartadas = len(self.lineas) - len(conservadas)
+            self.indices_conservados = indices
+            self.lineas = conservadas
+        return self
+
+    @model_validator(mode="after")
+    def iva_indicado_pero_no_repercutido(self) -> "AlbaranLLM":
+        """Una cuota de IVA en blanco es una cuota de 0, no un dato inválido.
+
+        En muchos albaranes de ENTREGA el pie muestra el tipo ("% IVA: 10") pero
+        deja vacía la casilla "Total I.V.A.", y el TOTAL coincide con la base: el
+        IVA se indica como referencia y se repercutirá en la factura. Tanto la
+        validación de Python como `confirm_albaran_v1` ya contemplan una cuota de
+        0 por este motivo, pero trataban la casilla VACÍA como tramo corrupto y
+        bloqueaban la confirmación, obligando a reteclear el albarán entero a
+        mano aunque todo lo demás estuviera bien.
+
+        Solo se rellena lo que falta: si la cuota viene informada no se toca. Si
+        el OCR se hubiera saltado una cuota que sí se cobra, el total dejará de
+        cuadrar con base + IVA y saltará ese aviso concreto, que sí es accionable.
+        """
+        tramos = self.detalle_iva or []
+        for tramo in tramos:
+            if tramo.cuota is None and tramo.tipo is not None and tramo.base is not None:
+                tramo.cuota = 0.0
+        if tramos and self.total_iva is None and all(
+            (tramo.cuota or 0) == 0 for tramo in tramos
+        ):
+            self.total_iva = 0.0
+        return self
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
 
@@ -320,9 +392,9 @@ Extrae TODOS los datos del albarán y devuelve JSON con esta estructura exacta:
   "numero_albaran": "número o null",
   "fecha": "DD/MM/YYYY",
   "forma_pago": "forma de pago o null",
-  "base_imponible": suma de todas las bases imponibles o null,
-  "total_iva": suma de todas las cuotas IVA o null,
-  "total": número total del albarán o null,
+  "base_imponible": la base imponible IMPRESA en el albarán (si hay varios tramos, la suma de sus bases impresas) o null,
+  "total_iva": el IVA IMPRESO (si hay varios tramos, la suma de sus cuotas impresas) o null,
+  "total": el total IMPRESO del albarán o null,
   "detalle_iva": array con los tipos de IVA desglosados, o null si no aparecen:
     [{"tipo": 10, "base": 307.53, "cuota": 30.75}, {"tipo": 4, "base": 30.87, "cuota": 1.23}],
   "lineas": [
@@ -357,6 +429,45 @@ Ejemplo: "IVA 10% 307,53€ = 30,75€" y "IVA 4% 30,87€ = 1,23€" →
   total_iva: 31.98 (suma de 30.75 + 1.23)
 Si solo hay un tipo, igual extráelo: [{"tipo": 10, "base": 307.53, "cuota": 30.75}]
 Si no aparece desglose de IVA, pon detalle_iva: null.
+
+CÓMO LEER LA TABLA DE TOTALES (no te dejes tramos):
+La tabla de totales del pie puede tener VARIAS FILAS, y cada fila con su propia
+base + % de IVA + cuota es un tramo distinto. Recórrelas TODAS, de arriba abajo.
+  - Una fila cuenta como tramo aunque el número total del albarán solo aparezca
+    en la primera: las filas siguientes suelen dejar esa celda vacía.
+  - Una fila cuenta como tramo AUNQUE alguna de sus otras celdas traiga texto que
+    no tiene nada que ver (una nota, un rótulo, un cargo suelto tipo "P.V.: 1,25",
+    "Portes", "Envases"). Ese texto NO invalida la fila: coge igualmente su base,
+    su % y su cuota. Descartar la fila entera por ese texto es el error más caro,
+    porque se pierde un tramo de IVA y entonces ya nada cuadra.
+  - No confundas la columna de suma de líneas (TOTAL IMPORTES, SUMA, BRUTO) con
+    BASE IMPONIBLE: pueden diferir si el albarán añade cargos aparte.
+  Ejemplo de tabla a dos filas donde la segunda trae un rótulo pegado:
+    | TOTAL IMPORTES | BASE IMPONIBLE | % I.V.A. | TOTAL I.V.A. | TOTAL € |
+    |     314,97     |     285,72     |  21,00   |    60,00     | 379,27  |
+    |   P.V.: 1,25   |      30,50     |  10,00   |     3,05     |         |
+  → son DOS tramos:
+    detalle_iva: [{"tipo": 21, "base": 285.72, "cuota": 60.00},
+                  {"tipo": 10, "base": 30.50,  "cuota": 3.05}]
+    base_imponible: 316.22   (285,72 + 30,50)
+    total_iva: 63.05         (60,00 + 3,05)
+    total: 379.27
+    (sería un error grave devolver solo el tramo del 21% y una base de 285,72)
+
+REGLA CRÍTICA — NUNCA CALCULES LOS TOTALES TÚ:
+base_imponible, total_iva y total se TRANSCRIBEN, no se calculan.
+  - Si el albarán los imprime, cópialos tal cual.
+  - Si hay tramos de IVA impresos, puedes sumar esas pocas cifras impresas.
+  - Si el albarán NO imprime totales (hay tabla de productos pero el documento
+    termina sin BASE IMPONIBLE / TOTAL / IVA), devuelve null en los tres.
+    NO los deduzcas sumando los importes de las líneas: sumar decenas de números
+    de cabeza da un resultado distinto cada vez y corrompe la contabilidad.
+    Un null es correcto y esperado; de la suma ya se encarga el sistema, que no
+    se equivoca nunca. Inventar un total es el peor error posible.
+  - Ojo: una fila al pie con un único número puede ser el total de KILOS o de
+    bultos, no de dinero. Si no está etiquetada como importe/base/total, ignórala.
+Lo mismo para el IVA: si el albarán no menciona IVA por ningún sitio, total_iva
+va a null y detalle_iva a null. No supongas un 21% ni ningún otro tipo.
 
 REGLA CRÍTICA — NÚMERO DEL DOCUMENTO:
 `numero_albaran` es exclusivamente el valor etiquetado como ALBARÁN / Nº ALBARÁN.
