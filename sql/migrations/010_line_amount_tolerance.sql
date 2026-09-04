@@ -286,4 +286,9 @@ REVOKE ALL ON FUNCTION public.confirm_albaran_v1(UUID, TEXT, TEXT, TEXT, JSONB, 
 GRANT EXECUTE ON FUNCTION public.confirm_albaran_v1(UUID, TEXT, TEXT, TEXT, JSONB, JSONB, UUID)
     TO service_role;
 
+INSERT INTO public.audit_events (actor_type,actor_id,event_type,data)
+VALUES ('migration','010_line_amount_tolerance','schema.line_amount_tolerance_enabled',
+        jsonb_build_object('scope','confirm_albaran_v1'))
+ON CONFLICT DO NOTHING;
+
 COMMIT;

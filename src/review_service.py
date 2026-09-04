@@ -122,6 +122,70 @@ def _lineas_corregidas_a_mano(candidate: dict[str, Any]) -> list[str]:
     return nombres
 
 
+_TIPOS_QUE_EXISTEN = (0.0, 4.0, 5.0, 10.0, 21.0)
+
+
+def _explicacion_de_iva(item: dict, candidate: dict[str, Any]) -> str | None:
+    """Traduce los descuadres de IVA a algo que se pueda comprobar en la foto.
+
+    El volcado técnico llegaba a decir «la cuota no coincide con base × tipo:
+    observado 36,1 → propuesto 201,12». Los 201,12 € salían de aplicar un IVA
+    del 47,1% —que no existe— a una base mal leída: un número que no está en el
+    papel y al que nadie con la foto delante puede llegar. Un aviso así no
+    ayuda, solo asusta.
+    """
+    reason = str(item.get("reason_code") or "")
+    if reason not in {"vat_quota_mismatch", "vat_bases_mismatch", "vat_total_mismatch"}:
+        return None
+    header = candidate.get("header") or {}
+    tramos = header.get("detalle_iva") or []
+    tipo_ilegal = next(
+        (t.get("tipo") for t in tramos
+         if t.get("tipo") is not None and float(t["tipo"]) not in _TIPOS_QUE_EXISTEN),
+        None,
+    )
+    if tipo_ilegal is not None:
+        return (
+            f"El tipo de IVA que hemos leído, {_number(tipo_ilegal)}%, no existe: "
+            "en España son 0, 4, 5, 10 o 21. Casi seguro que esa casilla del pie "
+            "es un importe y no un porcentaje, o que el número está mal leído."
+        )
+    base = header.get("base_imponible")
+    iva = header.get("total_iva")
+    total = header.get("total")
+    if base is not None and iva is not None and total is not None:
+        return (
+            f"El desglose de IVA del pie no cuadra con el resto: base "
+            f"{_euros(base)}, IVA {_euros(iva)}, total {_euros(total)}. "
+            "Comprueba en la foto cuál de las tres cifras está mal."
+        )
+    return "El desglose de IVA del pie no cuadra. Compruébalo en la foto."
+
+
+def _explicacion_del_cuadre(item: dict, cuadre: dict[str, Any] | None) -> str | None:
+    """Cuando el albarán se puede cuadrar, un solo relato para todos los avisos.
+
+    Si no, cada regla contaba su versión y se contradecían entre sí: una decía
+    «faltan 6 € y suelen ser portes» mientras otra decía «el tipo de IVA no
+    existe». Las dos miraban el mismo error de lectura desde ángulos distintos,
+    y juntas daban la impresión de que el bot se peleaba consigo mismo.
+    """
+    if not cuadre:
+        return None
+    if str(item.get("reason_code")) not in _DESCUADRES_DE_TOTALES:
+        return None
+    origen = (
+        "con la cantidad que has corregido, los productos suman"
+        if cuadre.get("sobre_lineas_corregidas") else "los productos suman"
+    )
+    return (
+        f"Las cifras del pie no cuadran entre sí, así que alguna está mal leída. "
+        f"Pero {origen} {_euros(cuadre['base'])} y el total impreso es "
+        f"{_euros(cuadre['total'])}: la diferencia es exactamente un IVA del "
+        f"{cuadre['etiqueta']}, y cuadra al céntimo."
+    )
+
+
 def _explicacion_descuadre(item: dict, corregidas: list[str] | None = None) -> str | None:
     """Explica un descuadre de totales por la DIFERENCIA, no por el valor a copiar.
 
@@ -417,13 +481,24 @@ async def build_review_view(ingestion_id: str, user_id: int) -> ReviewView:
         # Aquí sí hace falta que la persona corrija algo: mantenemos el detalle
         # técnico (reason_code, observado/propuesto) porque sirve para localizar
         # el campo exacto a corregir con /corregir.
+        cuadre = arbitrar_con_el_total_impreso(candidate, reviews)
         text.extend(["", "⚠️ Hay diferencias que impiden confirmar:"])
+        # Varias reglas pueden mirar el mismo error desde ángulos distintos y
+        # compartir explicación; repetirla palabra por palabra hace pensar que
+        # son problemas distintos.
+        ya_dicho: set[str] = set()
         for item in reviews[:12]:
             if str(item.get("reason_code")) not in hard_reasons:
                 continue
-            explicacion = _explicacion_descuadre(item, _lineas_corregidas_a_mano(candidate))
+            explicacion = (
+                _explicacion_del_cuadre(item, cuadre)
+                or _explicacion_descuadre(item, _lineas_corregidas_a_mano(candidate))
+                or _explicacion_de_iva(item, candidate)
+            )
             if explicacion:
-                text.append(f"• {explicacion}")
+                if explicacion not in ya_dicho:
+                    ya_dicho.add(explicacion)
+                    text.append(f"• {explicacion}")
                 continue
             detail = ""
             observed = item.get("observed_value")
@@ -539,6 +614,7 @@ async def reject_ingestion(
 _ALTA_LINEA = {"añadir", "anadir", "añade", "agregar", "add"}
 _BAJA_LINEA = {"borrar", "eliminar", "quitar", "borra"}
 _CARGO = {"cargo", "portes", "envases"}
+_CUADRE = {"cuadrar", "cuadre"}
 CARGO_SIN_IDENTIFICAR = "Cargo sin identificar"
 
 
@@ -674,6 +750,162 @@ def _recalcular_linea(linea: dict[str, Any], campo: str) -> str | None:
             linea.setdefault("valores_calculados", {})["precio_neto_resuelto"] = nuevo
             return f"el precio pasa a {_number(nuevo, 4)}€/u"
     return None
+
+
+# Jerarquía de confianza. Es la regla que decide quién cede cuando dos cifras
+# del albarán se contradicen:
+#
+#   1. corregido por una persona   ← manda siempre
+#   2. impreso y legible en la foto
+#   3. calculado por nosotros
+#
+# Un nivel bajo nunca contradice a uno alto: cede y se recalcula. Solo cuando
+# chocan dos del mismo nivel hay que preguntar.
+#
+# La clave está en el nivel 1. Si alguien ha corregido una cifra es precisamente
+# porque el OCR la leyó mal, así que a partir de ahí el resto del documento se
+# resuelve ALREDEDOR de ese dato, nunca discutiéndolo. Sin esta regla el bot
+# llegaba a pedir «los tramos no suman el IVA total: 42,1 → 36,1», es decir, a
+# pedirle a la persona que deshiciera su propia corrección y volviera al número
+# equivocado.
+
+
+# Campos de cabecera sobre los que un aviso propondría "vuelve al valor de
+# antes". Si la persona ya fijó ese campo, ese aviso está mal planteado: el
+# problema no es su dato, es la otra cifra de la comparación.
+_AVISOS_QUE_REVIERTEN = {
+    "vat_total_mismatch": "total_iva",
+    "vat_bases_mismatch": "base_imponible",
+    "base_lines_mismatch": "base_imponible",
+}
+
+
+def descartar_avisos_que_revierten(
+    reviews: list[dict[str, Any]], candidate: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Quita los avisos que le pedirían a la persona deshacer su corrección.
+
+    Con la base corregida a 421 €, el bot llegaba a decir «los tramos no suman
+    el IVA total: 42,1 → 36,1»: le estaba pidiendo que volviera al número
+    equivocado que acababa de arreglar. Un aviso así no es un aviso, es un
+    bucle; y como el tramo de IVA no se puede editar desde Telegram, además era
+    un callejón sin salida.
+
+    No se tapa nada: lo que quede realmente descuadrado sigue saliendo por el
+    otro lado de la comparación, que es el que sí hay que revisar.
+    """
+    fijados = _campos_fijados(candidate)
+    if not fijados:
+        return reviews
+    return [
+        item for item in reviews
+        if _AVISOS_QUE_REVIERTEN.get(str(item.get("reason_code"))) not in fijados
+    ]
+
+
+def _campos_fijados(candidate: dict[str, Any]) -> set[str]:
+    """Campos de cabecera que ha fijado una persona. Intocables."""
+    decisiones = (candidate.get("header") or {}).get("decisiones") or {}
+    return {
+        campo for campo, detalle in decisiones.items()
+        if isinstance(detalle, dict) and detalle.get("source") == "human_correction"
+    }
+
+
+def _hay_lineas_fijadas(candidate: dict[str, Any]) -> bool:
+    return bool(_lineas_corregidas_a_mano(candidate))
+
+
+def _tramo_unico_desde_la_cabecera(candidate: dict[str, Any]) -> str | None:
+    """Rehace el tramo único de IVA a partir de la cabecera corregida.
+
+    Con un solo tramo, el desglose no aporta información propia: es la misma
+    cifra escrita dos veces. Dejar la copia vieja mientras la cabecera se
+    corrige convertía el albarán en un callejón sin salida, porque el tramo
+    bloqueaba la confirmación y no había forma de editarlo desde Telegram.
+
+    Con varios tramos no se puede: no sabemos cómo repartir la base entre ellos,
+    así que ahí sigue haciendo falta una persona.
+    """
+    header = candidate.get("header") or {}
+    tramos = header.get("detalle_iva") or []
+    if len(tramos) != 1:
+        return None
+    fijados = _campos_fijados(candidate)
+    if not (fijados & {"base_imponible", "total_iva"}):
+        return None
+    base = _decimal(header.get("base_imponible"))
+    iva = _decimal(header.get("total_iva")) or 0.0
+    if base is None or base <= 0:
+        return None
+    tipo = round(iva / base * 100, 2)
+    anterior = tramos[0]
+    if (
+        _decimal(anterior.get("base")) == base
+        and _decimal(anterior.get("cuota")) == iva
+    ):
+        return None
+    header["detalle_iva"] = [{"tipo": tipo, "base": round(base, 2), "cuota": round(iva, 2)}]
+    return f"el tramo de IVA se rehace: {_number(tipo)}% sobre {_euros(base)} = {_euros(iva)}"
+
+
+def _base_sigue_a_las_lineas(candidate: dict[str, Any]) -> str | None:
+    """Si una persona corrigió una línea, la base la sigue aunque venga del OCR.
+
+    Antes la base solo se recalculaba si la habíamos calculado nosotros. Pero
+    una línea corregida a mano pesa más que una base leída por el OCR: quien
+    corrigió esa línea lo hizo mirando el papel, y bloquear el albarán por la
+    diferencia era hacerle pagar por haber acertado.
+    """
+    header = candidate.get("header") or {}
+    if "base_imponible" in _campos_fijados(candidate) or not _hay_lineas_fijadas(candidate):
+        return None
+    importes = [_decimal(linea.get("importe_neto")) for linea in candidate.get("lines") or []]
+    if not importes or any(importe is None for importe in importes):
+        return None
+    suma = round(sum(importes), 2)
+    anterior = _decimal(header.get("base_imponible"))
+    if anterior is not None and abs(anterior - suma) <= 0.02:
+        return None
+    header["base_imponible"] = suma
+    header.setdefault("decisiones", {})["base_imponible"] = {
+        "source": "derived_from_corrected_lines",
+        "rule": "la-linea-corregida-manda-sobre-la-base-leida",
+        "previous": anterior, "accepted": suma,
+    }
+    return f"la base pasa de {_euros(anterior)} a {_euros(suma)}"
+
+
+def _resolver_con_lo_corregido(candidate: dict[str, Any]) -> list[str]:
+    """Aplica la jerarquía tras una corrección y cuenta lo que ha cambiado."""
+    notas = [
+        _base_sigue_a_las_lineas(candidate),
+        _recalcular_totales_derivados(candidate),
+        _tramo_unico_desde_la_cabecera(candidate),
+        _ajustar_total_a_base_mas_iva(candidate),
+    ]
+    return [nota for nota in notas if nota]
+
+
+def _ajustar_total_a_base_mas_iva(candidate: dict[str, Any]) -> str | None:
+    """El total sigue a base + IVA cuando ninguno de los tres lo ha fijado nadie
+    y el total no está impreso en la foto: es una cifra nuestra, no un hecho."""
+    header = candidate.get("header") or {}
+    fijados = _campos_fijados(candidate)
+    if "total" in fijados:
+        return None
+    decision_totales = (header.get("decisiones") or {}).get("totales") or {}
+    if decision_totales.get("rule") != "sumado-de-lineas":
+        return None
+    base = _decimal(header.get("base_imponible"))
+    iva = _decimal(header.get("total_iva")) or 0.0
+    if base is None:
+        return None
+    total = round(base + iva, 2)
+    if _decimal(header.get("total")) == total:
+        return None
+    header["total"] = total
+    return f"el total pasa a {_euros(total)}"
 
 
 def _recalcular_totales_derivados(candidate: dict[str, Any]) -> str | None:
@@ -899,6 +1131,99 @@ def pregunta_de_correccion(view: "ReviewView", destino: list[str]) -> str:
     )
 
 
+# ── Cuadrar el albarán con su total impreso ──────────────────────────────────
+# Los tipos que existen en España, y las parejas IVA + recargo de equivalencia.
+# Un tipo fuera de esta lista no es un dato: es una mala lectura. En un albarán
+# manuscrito el modelo llegó a devolver un IVA del 47,1% —que no existe en
+# ningún país— porque la fila del pie estaba rotulada «% I.V.A.» pero contenía
+# un importe, no un porcentaje.
+_TIPOS_LEGALES = (
+    ("0%", 0.0), ("4%", 4.0), ("5%", 5.0), ("10%", 10.0), ("21%", 21.0),
+    ("4% + RE 0,5%", 4.5), ("10% + RE 1,4%", 11.4), ("21% + RE 5,2%", 26.2),
+)
+# Tolerancia deliberadamente diminuta. Es lo único que separa una lectura
+# correcta de un cargo disfrazado de IVA, y medida sobre albaranes reales la
+# distancia es enorme: el caso bueno encaja con 0,00 € de desvío y el falso
+# positivo más cercano se queda a 0,71 €, treinta y cinco veces la tolerancia.
+_CENTIMOS_DE_MARGEN = 0.02
+
+_DESCUADRES_DE_TOTALES = {
+    "base_lines_mismatch", "document_total_mismatch", "vat_quota_mismatch",
+    "vat_bases_mismatch", "vat_total_mismatch", "vat_detail_invalid",
+    "base_missing", "total_missing",
+}
+
+
+def arbitrar_con_el_total_impreso(
+    candidate: dict[str, Any], reviews: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Busca la lectura que hace cuadrar el albarán exacto, o devuelve None.
+
+    Un albarán manuscrito traía el pie mal leído dos veces con el mismo trazo
+    (421,00 → 427,00 y 42,10 → 47,10, un 1 leído como 7). Pero las líneas sumaban
+    421,00 y el TOTAL impreso ponía 463,10, y la diferencia entre ambos daba
+    exactamente el 10%. Dos cifras independientes del papel señalando el mismo
+    resultado no es una casualidad razonable: es la lectura correcta.
+
+    Solo propone; nunca decide sola. Y no toca jamás el total impreso ni las
+    líneas: se limita a deducir la base y el IVA que los reconcilian.
+    """
+    # `reviews=None` al aplicarlo: para entonces el botón ya se pulsó y lo que
+    # protege es la exactitud del cuadre, no que siga habiendo un aviso abierto.
+    if reviews is not None:
+        motivos = {str(item.get("reason_code")) for item in reviews}
+        if not (motivos & _DESCUADRES_DE_TOTALES):
+            return None                  # no hay nada que cuadrar
+    header = candidate.get("header") or {}
+    if len(header.get("detalle_iva") or []) > 1:
+        return None                      # con varios tramos no se puede repartir la base
+    impresos = (header.get("decisiones") or {}).get("impresos") or {}
+    if not impresos.get("total"):
+        return None                      # sin total impreso no hay árbitro
+    total = _decimal(header.get("total"))
+    importes = [_decimal(linea.get("importe_neto")) for linea in candidate.get("lines") or []]
+    if total is None or not importes or any(importe is None for importe in importes):
+        return None                      # con un hueco, la suma sería mentira
+    suma = round(sum(importes), 2)
+    diferencia = round(total - suma, 2)
+    if diferencia < 0:
+        return None                      # las líneas superan el total: algo va muy mal
+    for etiqueta, tipo in _TIPOS_LEGALES:
+        if abs(round(suma * tipo / 100, 2) - diferencia) <= _CENTIMOS_DE_MARGEN:
+            return {
+                "base": suma, "iva": diferencia, "total": round(total, 2),
+                "tipo": tipo, "etiqueta": etiqueta,
+                "sobre_lineas_corregidas": _hay_lineas_fijadas(candidate),
+            }
+    return None
+
+
+def aplicar_cuadre(candidate: dict[str, Any], user_id: int) -> str:
+    """Escribe el cuadre propuesto. El total impreso y las líneas no se tocan."""
+    propuesta = arbitrar_con_el_total_impreso(candidate)
+    if propuesta is None:
+        raise ValueError("Este albarán ya no se puede cuadrar con su total impreso")
+    header = candidate["header"]
+    anterior = (header.get("base_imponible"), header.get("total_iva"))
+    header["base_imponible"] = propuesta["base"]
+    header["total_iva"] = propuesta["iva"]
+    header["detalle_iva"] = [{
+        "tipo": propuesta["tipo"], "base": propuesta["base"], "cuota": propuesta["iva"],
+    }]
+    header.setdefault("decisiones", {})["totales"] = {
+        "rule": "cuadrado-con-el-total-impreso",
+        "motivo": "las líneas y el total impreso dan un tipo de IVA legal exacto",
+        "source": "human_correction", "actor": str(user_id),
+        "base_descartada": anterior[0], "iva_descartado": anterior[1],
+        "base_calculada": propuesta["base"], "total_calculado": propuesta["total"],
+    }
+    return (
+        f"Cuadrado con el total impreso: base {_euros(propuesta['base'])} "
+        f"+ IVA {propuesta['etiqueta']} ({_euros(propuesta['iva'])}) "
+        f"= {_euros(propuesta['total'])}"
+    )
+
+
 # Descuadres que delatan que las cifras del pie no son de fiar. Con cualquiera de
 # ellos presente no sabemos qué número está mal, así que no se ofrece el cargo:
 # convertir el hueco en una línea fosilizaría una mala lectura en vez de arreglarla.
@@ -915,6 +1240,13 @@ def _acciones_para(reviews: list[dict], candidate: dict[str, Any]) -> list[tuple
     motivos = {str(item.get("reason_code")) for item in reviews}
     if "date_invalid" in motivos:
         acciones.append(("📅 Es de hoy", "hoy"))
+    cuadre = arbitrar_con_el_total_impreso(candidate, reviews)
+    if cuadre:
+        acciones.append((
+            f"✅ Cuadrar: {_number(cuadre['base'])} + {cuadre['etiqueta']} "
+            f"= {_number(cuadre['total'])}",
+            "cuadrar",
+        ))
     if (
         "base_lines_mismatch" in motivos
         and not (motivos & _CIFRAS_DE_CABECERA_DUDOSAS)
@@ -991,6 +1323,8 @@ def _set_correction(candidate: dict[str, Any], args: list[str], user_id: int) ->
         return _borrar_linea(candidate, args[1:])
     if accion in _CARGO:
         return _añadir_cargo(candidate, args, user_id)
+    if accion in _CUADRE:
+        return aplicar_cuadre(candidate, user_id)
     if len(args) < 2:
         raise ValueError("Falta campo o valor")
     if args[0].lower() == "linea":
@@ -1035,12 +1369,14 @@ def _set_correction(candidate: dict[str, Any], args: list[str], user_id: int) ->
             raise ValueError("El NIF/CIF no supera el dígito de control")
     previous = target.get(field)
     target[field] = value
-    if target is candidate["header"] and field == "proveedor_nif":
-        target.setdefault("decisiones", {})["proveedor_nif"] = {
+    if target is candidate["header"]:
+        decision = {
             "source": "human_correction", "actor": str(user_id),
-            "previous": previous, "observed": previous, "accepted": value,
-            "rule": "human-validated",
+            "previous": previous, "accepted": value,
         }
+        if field == "proveedor_nif":
+            decision.update({"observed": previous, "rule": "human-validated"})
+        target.setdefault("decisiones", {})[field] = decision
     consecuencias: list[str] = []
     if target is candidate["header"]:
         nota_sin_iva = _igualar_base_y_total_sin_iva(target, field, previous)
@@ -1055,9 +1391,7 @@ def _set_correction(candidate: dict[str, Any], args: list[str], user_id: int) ->
         nota = _recalcular_linea(target, field)
         if nota:
             consecuencias.append(nota)
-    nota_totales = _recalcular_totales_derivados(candidate)
-    if nota_totales:
-        consecuencias.append(nota_totales)
+    consecuencias.extend(_resolver_con_lo_corregido(candidate))
     resumen = f"{label}: {_formatear_valor(previous)} → {_formatear_valor(value)}"
     resumen = resumen[0].upper() + resumen[1:]
     if consecuencias:
@@ -1109,7 +1443,9 @@ async def correct_candidate(reference: str, user_id: int, correction_args: list[
         revised, perceptual_hash=ingestion.get("perceptual_hash"),
         exclude_ingestion_id=ingestion_id,
     )
-    reviews = _review_items(report, artifact["id"], probable)
+    reviews = descartar_avisos_que_revierten(
+        _review_items(report, artifact["id"], probable), revised
+    )
     if not reviews:
         reviews.append({
             "extraction_artifact_id": artifact["id"], "entity_type": "document",

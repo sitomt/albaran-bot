@@ -4,9 +4,12 @@ Punto de entrada del sistema. Arranca con: python src/bot.py
 """
 from __future__ import annotations
 
+import fcntl
 import logging
 import io
+import os
 import re
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytz
@@ -921,6 +924,8 @@ async def handle_callback(update: Update, context: CallbackContext) -> None:
                 args = ["fecha", date.today().strftime("%d/%m/%Y")]
             elif accion == "cargo":
                 args = ["cargo"]
+            elif accion == "cuadrar":
+                args = ["cuadrar"]
             else:
                 raise ValueError("Acción no reconocida")
             view = await correct_candidate(ingestion_id[:8], user_id, args)
@@ -1238,7 +1243,82 @@ async def post_init(application: Application) -> None:
     logger.info("Pool durable de 2 workers iniciado")
 
 
+# El descriptor debe sobrevivir a la función: cerrarlo liberaría el cerrojo y
+# permitiría justo lo que este código impide.
+_INSTANCE_LOCK_FD: int | None = None
+
+
+def _adquirir_cerrojo_de_instancia() -> None:
+    """Telegram solo admite un consumidor de `getUpdates` por token.
+
+    Dos procesos con el mismo token no se reparten el trabajo: se expulsan
+    mutuamente con `Conflict: terminated by other getUpdates request`, y el bot
+    deja de responder a los dos propietarios. El cerrojo es un fichero en el
+    volumen de runtime, así que el sistema operativo lo libera solo si el
+    proceso muere de cualquier forma, incluido un kill -9.
+    """
+    global _INSTANCE_LOCK_FD
+
+    runtime_dir = settings.RUNTIME_DIR
+    os.makedirs(runtime_dir, exist_ok=True)
+    lock_path = os.path.join(runtime_dir, "bot.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        logger.error(
+            "Ya hay otra instancia del bot con este cerrojo (%s). Dos procesos "
+            "compartiendo token se expulsan del long polling y el bot deja de "
+            "responder: este arranque se cancela.", lock_path,
+        )
+        sys.exit(69)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    _INSTANCE_LOCK_FD = fd
+    logger.info("Cerrojo de instancia única adquirido en %s (pid %s)", lock_path, os.getpid())
+
+
+async def on_error(update: object, context: CallbackContext) -> None:
+    """Una excepción no capturada no puede dejar a la persona sin respuesta.
+
+    Sin este handler, python-telegram-bot solo escribe la traza en el log
+    ("No error handlers are registered") y quien mandó la foto se queda mirando
+    un chat mudo, sin saber si su albarán se perdió. El original ya está
+    guardado antes de responder, así que aquí solo hace falta decirlo.
+    """
+    logger.error("Excepción no capturada en un handler", exc_info=context.error)
+
+    chat_id = None
+    if isinstance(update, Update) and update.effective_chat:
+        chat_id = update.effective_chat.id
+    if chat_id is None:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=("Se me ha ido algo al procesar eso. Lo que ya habías enviado "
+                  "sigue guardado; puedes reintentarlo o escribir /estado para ver "
+                  "cómo va la cola."),
+        )
+    except Exception:
+        # Avisar del fallo no puede provocar un segundo fallo en cascada.
+        logger.exception("Tampoco se pudo avisar del error al chat %s", chat_id)
+
+    admin_chat = settings.TELEGRAM_ADMIN_CHAT_ID
+    if admin_chat and str(admin_chat) != str(chat_id):
+        try:
+            await context.bot.send_message(
+                chat_id=int(admin_chat),
+                text=f"⚠️ Error no capturado: {type(context.error).__name__}: "
+                     f"{str(context.error)[:300]}",
+            )
+        except Exception:
+            logger.exception("No se pudo avisar al administrador")
+
+
 def main() -> None:
+    _adquirir_cerrojo_de_instancia()
     app = (
         ApplicationBuilder()
         .token(settings.TELEGRAM_BOT_TOKEN)
@@ -1268,6 +1348,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
 
     if settings.TELEGRAM_ADMIN_CHAT_ID:
         app.job_queue.run_repeating(monitor_operativo, interval=900, first=60)

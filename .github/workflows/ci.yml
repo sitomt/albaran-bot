@@ -53,8 +53,10 @@ jobs:
             psql -v ON_ERROR_STOP=1 -f "$migration"
           done
           expected_events="$(find sql/migrations -type f -name '*.sql' ! -name '000_*' ! -name '001_*' | wc -l | tr -d ' ')"
-          test "$(psql -At -v ON_ERROR_STOP=1 -c \
-            "SELECT count(*) FROM audit_events WHERE actor_type='migration')" -eq "$expected_events"
+          actual_events="$(psql -At -v ON_ERROR_STOP=1 \
+            -c "SELECT count(*) FROM audit_events WHERE actor_type = 'migration'")"
+          echo "Eventos de migración: $actual_events (esperados $expected_events)"
+          test "$actual_events" -eq "$expected_events"
 
       - name: Run transactional database contract tests
         run: psql -v ON_ERROR_STOP=1 -f sql/tests/production_contract.sql

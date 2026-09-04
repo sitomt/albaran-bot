@@ -96,4 +96,12 @@ BEGIN
                               'status','queued');
 END $function$;
 
+-- La huella de la migración es lo que permite auditar qué esquema corre en cada
+-- entorno; el índice parcial `uq_audit_migration_event_once` la mantiene única
+-- aunque la migración se reaplique.
+INSERT INTO public.audit_events (actor_type,actor_id,event_type,data)
+VALUES ('migration','011_retry_backoff','schema.retry_backoff_enabled',
+        jsonb_build_object('column','jobs.available_at','claim_respects_backoff',true))
+ON CONFLICT DO NOTHING;
+
 COMMIT;

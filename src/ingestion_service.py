@@ -403,6 +403,14 @@ def _candidate_payload(
         accepted["decisiones"] = {"rule": "net-price-v2", "requires_human_acceptance": True}
         lines.append(accepted)
     _derivar_totales_ausentes(header, lines, ocr_text)
+    # Qué cifras del pie están REALMENTE escritas en la foto. La revisión no
+    # tiene el OCR delante, y sin este apunte no puede distinguir un total
+    # impreso —un hecho del papel, y el mejor árbitro que hay para cuadrar un
+    # albarán— de uno que hemos calculado nosotros sumando líneas.
+    header.setdefault("decisiones", {})["impresos"] = {
+        campo: _amount_is_visible(header.get(campo), ocr_text)
+        for campo in ("base_imponible", "total_iva", "total")
+    }
     if getattr(model, "lineas_descartadas", 0):
         header.setdefault("decisiones", {})["lineas"] = {
             "rule": "filas-de-catalogo-descartadas",

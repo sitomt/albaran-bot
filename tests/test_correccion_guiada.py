@@ -90,15 +90,31 @@ def test_corregir_el_importe_recalcula_el_precio_unitario():
     assert "el precio pasa a" in resumen
 
 
-def test_un_total_impreso_en_el_papel_no_se_recalcula():
-    """La base 133,67 está impresa. Si tras corregir deja de cuadrar con las
-    líneas, eso es justo lo que una persona tiene que ver: recalcularla en
-    silencio taparía que alguna de las dos lecturas sigue mal."""
+def test_una_linea_corregida_a_mano_manda_sobre_la_base_leida_por_el_ocr():
+    """Una corrección no es una opinión: es un dato mejor que el del OCR.
+
+    Si alguien ha tocado la cantidad de una línea es precisamente porque el OCR
+    la leyó mal, así que la base leída por ese mismo OCR ya no puede imponerse.
+    Antes se conservaba la base impresa y el albarán quedaba bloqueado por la
+    diferencia: se le hacía pagar a la persona por haber acertado.
+    """
     candidato = _albaran_intesa()
     _set_correction(candidato, ["linea", "1", "cantidad", "15,4"], 7)
 
+    assert candidato["header"]["base_imponible"] == 132.29
+    procedencia = candidato["header"]["decisiones"]["base_imponible"]
+    assert procedencia["source"] == "derived_from_corrected_lines"
+    assert procedencia["previous"] == 133.67          # queda anotado lo que había
+
+
+def test_una_base_que_tu_has_fijado_no_la_mueve_ninguna_linea():
+    """El otro lado de la misma regla: si la base la has escrito tú, es nivel 1
+    y no la puede recalcular nada."""
+    candidato = _albaran_intesa()
+    _set_correction(candidato, ["base", "133,67"], 7)
+    _set_correction(candidato, ["linea", "1", "cantidad", "15,4"], 7)
+
     assert candidato["header"]["base_imponible"] == 133.67
-    assert candidato["header"]["total"] == 133.67
 
 
 def test_un_total_que_calculamos_nosotros_sigue_a_las_lineas():
