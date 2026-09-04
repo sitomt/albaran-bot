@@ -611,9 +611,28 @@ def _provenance_issues(candidate: dict[str, Any]) -> list[ValidationIssue]:
                 changed = abs(float(raw_quantity) - float(line["cantidad"])) > 0.001
             except (TypeError, ValueError):
                 changed = True
-            if changed:
+            if changed and _linea_cobrada_por_peso(line, raw):
+                # No se ha corregido nada del papel: el albarán trae unidades y kilos,
+                # y el importe impreso cuadra al céntimo con los kilos. Solo hemos
+                # elegido la columna de kilos como cantidad. Es una lectura, no una
+                # sospecha, así que se cuenta pero no se pide confirmarla.
+                line.setdefault("decisiones", {})["cantidad"] = {
+                    "rule": "cobrada-por-peso",
+                    "unidades_observadas": raw_quantity,
+                    "kg": line.get("cantidad"),
+                    "precio_kg": line.get("precio_unitario"),
+                    "importe": line.get("importe_neto"),
+                }
                 issues.append(ValidationIssue(
-                    "line_quantity_adjusted", "La cantidad aceptada fue ajustada por una regla de peso.",
+                    "line_priced_by_weight",
+                    "La línea se cobra por peso; la cantidad son los kilos impresos.",
+                    severity="info", field="cantidad", line_index=index,
+                    observed=raw_quantity, expected=line.get("cantidad"),
+                ))
+            elif changed:
+                issues.append(ValidationIssue(
+                    "line_quantity_adjusted",
+                    "La cantidad aceptada se ajustó para cuadrar con el importe impreso.",
                     severity="warning", field="cantidad", line_index=index,
                     observed=raw_quantity, expected=line.get("cantidad"),
                 ))
@@ -645,6 +664,26 @@ def _provenance_issues(candidate: dict[str, Any]) -> list[ValidationIssue]:
     return issues
 
 
+def _linea_cobrada_por_peso(line: dict[str, Any], raw: dict[str, Any]) -> bool:
+    """Kilos × precio = importe impreso, al céntimo: la línea se factura al peso.
+
+    Distingue "hemos elegido la columna de kilos" de un ajuste real de cantidad.
+    Con cualquier otra unidad, o si el importe no cuadra exacto con los kilos,
+    la cantidad cambiada sigue siendo un ajuste que una persona debe validar.
+    """
+    if str(line.get("unidad") or "").lower() != "kg":
+        return False
+    try:
+        kg = float(line.get("cantidad"))
+        precio = float(line.get("precio_unitario"))
+        importe_impreso = float(raw.get("importe_neto"))
+    except (TypeError, ValueError):
+        return False
+    if kg <= 0 or precio <= 0:
+        return False
+    return abs(round(kg * precio, 2) - round(importe_impreso, 2)) <= 0.01
+
+
 def _amount_is_visible(value: Any, ocr_text: str) -> bool:
     try:
         number = float(value)
@@ -661,6 +700,44 @@ def _amount_is_visible(value: Any, ocr_text: str) -> bool:
     }
     compact = ocr_text.replace(" ", "")
     return any(variant in compact for variant in variants)
+
+
+def _compuesto_de_tramos_visibles(
+    field: str, header: dict[str, Any], ocr_text: str,
+) -> dict[str, Any] | None:
+    """Base o IVA total como suma de tramos de IVA impresos, todos legibles.
+
+    Exige al menos dos tramos (con uno, la base total ya estaría impresa), que
+    cada base y cada cuota aparezcan literalmente en el OCR y que su suma
+    coincida al céntimo con la cifra de cabecera. Cualquier hueco devuelve None
+    y deja en pie el aviso de "no observado".
+    """
+    componente = {"base_imponible": "base", "total_iva": "cuota"}.get(field)
+    if componente is None:
+        return None
+    tramos = [t for t in (header.get("detalle_iva") or []) if isinstance(t, dict)]
+    if len(tramos) < 2:
+        return None
+    try:
+        objetivo = round(float(header.get(field)), 2)
+    except (TypeError, ValueError):
+        return None
+    suma = 0.0
+    for tramo in tramos:
+        for clave in ("base", "cuota"):
+            if not _amount_is_visible(tramo.get(clave), ocr_text):
+                return None
+        try:
+            suma += float(tramo[componente])
+        except (TypeError, ValueError, KeyError):
+            return None
+    if abs(round(suma, 2) - objetivo) > 0.01:
+        return None
+    return {
+        "rule": "suma-de-tramos-iva",
+        "tramos": [{"tipo": t.get("tipo"), componente: t.get(componente)} for t in tramos],
+        "suma": round(suma, 2),
+    }
 
 
 def _header_provenance_issues(candidate: dict[str, Any], ocr_text: str) -> list[ValidationIssue]:
@@ -689,12 +766,21 @@ def _header_provenance_issues(candidate: dict[str, Any], ocr_text: str) -> list[
         if totales.get("rule") == "sumado-de-lineas" and field in ("base_imponible", "total"):
             continue  # ya explicado arriba; no repetir el aviso genérico
         value = header.get(field)
-        if value is not None and not _amount_is_visible(value, ocr_text):
-            issues.append(ValidationIssue(
-                "header_value_not_observed",
-                f"{field} no aparece literalmente en el OCR; puede ser un cálculo o una inferencia.",
-                severity="warning", field=field, observed=None, expected=value,
-            ))
+        if value is None or _amount_is_visible(value, ocr_text):
+            continue
+        composicion = _compuesto_de_tramos_visibles(field, header, ocr_text)
+        if composicion is not None:
+            # Un pie con varios tipos de IVA imprime cada base y cada cuota, pero
+            # no su suma. La suma de cifras leídas del papel sigue siendo un
+            # hecho del papel; avisar de que "no aparece" solo sembraría dudas
+            # sobre un albarán perfectamente desglosado.
+            header.setdefault("decisiones", {})[field] = composicion
+            continue
+        issues.append(ValidationIssue(
+            "header_value_not_observed",
+            f"{field} no aparece literalmente en el OCR; puede ser un cálculo o una inferencia.",
+            severity="warning", field=field, observed=None, expected=value,
+        ))
     return issues
 
 
@@ -774,6 +860,8 @@ def _review_items(
     # se queda el que bloquea — nunca se pierde silenciosamente un error real.
     by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     for issue in report.issues:
+        if issue.severity == "info":
+            continue  # se explica en el resumen; no hay nada que aceptar ni corregir
         entity_type = "line" if issue.line_index is not None else "document"
         entity_key = str(issue.line_index or "header")
         field_name = issue.field or issue.code
@@ -942,10 +1030,13 @@ async def process_ingestion(ingestion_id: str, *, attempt: int = 1) -> Candidate
     )
     provenance_issues = _provenance_issues(candidate) + _header_provenance_issues(candidate, ocr.text)
     if provenance_issues:
+        # Una nota informativa se conserva en el informe (queda en el artefacto y
+        # en el resumen), pero no convierte un candidato limpio en revisable.
+        bloqueantes = any(issue.severity != "info" for issue in provenance_issues)
         report = ValidationReport(
             issues=report.issues + tuple(provenance_issues),
             line_sum=report.line_sum,
-            auto_confirmable=False,
+            auto_confirmable=report.auto_confirmable and not bloqueantes,
         )
     candidate_artifact = await db.registrar_artefacto_extraccion(
         ingestion_id=ingestion_id, attempt=attempt, artifact_type="candidate",
@@ -1045,8 +1136,13 @@ def format_candidate_summary(result: CandidateResult) -> str:
     lines = result.candidate["lines"]
     total = header.get("total")
     total_text = f"{float(total):.2f}€".replace(".", ",") if total is not None else "sin total"
-    reasons = sorted({issue.code for issue in result.validation.issues})
-    hard_issues = [issue for issue in result.validation.issues if issue.severity != "warning"]
+    reasons = sorted({
+        issue.code for issue in result.validation.issues if issue.severity != "info"
+    })
+    hard_issues = [
+        issue for issue in result.validation.issues
+        if issue.severity not in ("warning", "info")
+    ]
     text = [
         f"Albarán extraído — {header.get('proveedor_nombre') or 'proveedor desconocido'}",
         f"{len(lines)} líneas | {total_text}",
@@ -1063,5 +1159,31 @@ def format_candidate_summary(result: CandidateResult) -> str:
         text.append("Todas las validaciones automáticas han pasado; falta la confirmación de un propietario.")
     else:
         text.append("Todas las validaciones automáticas han pasado.")
+    text.extend(notas_informativas(lines))
     text.append(f"Referencia: {result.ingestion_id[:8]}")
     return "\n".join(text)
+
+
+def _eur(value: Any, decimals: int = 2) -> str:
+    try:
+        rendered = f"{float(value):.{decimals}f}"
+    except (TypeError, ValueError):
+        return str(value)
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered.replace(".", ",")
+
+
+def notas_informativas(lines: list[dict[str, Any]]) -> list[str]:
+    """Lecturas que conviene contar pero que no piden nada a nadie."""
+    notas: list[str] = []
+    for index, line in enumerate(lines, start=1):
+        decision = (line.get("decisiones") or {}).get("cantidad") or {}
+        if decision.get("rule") == "cobrada-por-peso":
+            nombre = line.get("descripcion_limpia") or "producto sin nombre"
+            notas.append(
+                f"ℹ️ La línea {index} ({nombre}) se cobra por peso: "
+                f"{_eur(decision.get('kg'), 3)} kg × {_eur(decision.get('precio_kg'), 4)}€ "
+                f"= {_eur(decision.get('importe'))}€."
+            )
+    return notas

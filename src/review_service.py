@@ -17,6 +17,7 @@ from .ingestion_service import (
     _find_probable_duplicate,
     _review_items,
     load_candidate,
+    notas_informativas,
 )
 
 HEADER_FIELDS = {
@@ -68,8 +69,8 @@ _WARNING_LINE_TEMPLATES = {
         "exactamente con lo impreso."
     ),
     "line_quantity_adjusted": (
-        "Hemos corregido la cantidad de la línea {n} ({nombre}) porque el peso impreso "
-        "no encajaba con el resto de datos."
+        "Hemos ajustado la cantidad de la línea {n} ({nombre}) para que cuadre con el "
+        "importe impreso; comprueba que es la cantidad correcta."
     ),
     "line_price_derived": (
         "El precio de la línea {n} ({nombre}) no aparecía escrito, así que lo hemos "
@@ -297,7 +298,7 @@ REASON_LABELS = {
     "document_total_mismatch": "Base + IVA no coincide con el total",
     "line_amount_derived": "El importe fue calculado porque no era legible",
     "line_amount_adjusted": "El importe aceptado difiere del leído",
-    "line_quantity_adjusted": "La cantidad fue ajustada por una regla de peso",
+    "line_quantity_adjusted": "La cantidad se ajustó para cuadrar con el importe impreso",
     "line_price_derived": "El neto se calculó desde tarifa y descuento",
     "line_price_adjusted": "El precio neto aceptado difiere del leído",
     "header_value_not_observed": "La cifra no aparece literal y puede ser una suma calculada",
@@ -469,6 +470,9 @@ async def build_review_view(ingestion_id: str, user_id: int) -> ReviewView:
             )
         else:
             text.append(_line_summary(index, line))
+    notas = notas_informativas(lines)
+    if notas:
+        text.extend(["", *notas])
     vat_details = header.get("detalle_iva") or []
     if vat_details:
         text.extend(["", "IVA:"])
