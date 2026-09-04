@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import re
 import socket
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,6 +27,16 @@ logger = logging.getLogger(__name__)
 
 _LEASE_SECONDS = 300
 _HEARTBEAT_INTERVAL_SECONDS = 90
+# El límite del proveedor se mide por minuto: reintentar en el mismo segundo solo
+# garantiza otro 429 y quema el intento. La primera espera ya cruza un cuarto de
+# ventana y la última supera holgadamente el minuto.
+_RETRY_BASE_SECONDS = 20.0
+_RETRY_MAX_SECONDS = 300.0
+_RETRY_JITTER_SECONDS = 5.0
+_RETRY_AFTER_PATTERNS = (
+    re.compile(r"retry[-_ ]?after[\"'\s:=]+(\d+(?:\.\d+)?)", re.IGNORECASE),
+    re.compile(r"(?:try again|reintenta\w*) in (\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
+)
 
 
 class LeaseLostError(RuntimeError):
@@ -84,6 +97,31 @@ async def _process_with_lease_heartbeat(
         await asyncio.gather(processing, heartbeat, return_exceptions=True)
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """El proveedor sabe mejor que nosotros cuándo vuelve a aceptar tráfico."""
+    text = str(exc)
+    for pattern in _RETRY_AFTER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def _retry_delay_seconds(exc: Exception, attempts: int) -> float:
+    """Backoff exponencial con jitter, acotado y respetando el `retry-after`."""
+    explicit = _retry_after_seconds(exc)
+    if explicit is not None:
+        return min(max(explicit, 1.0), _RETRY_MAX_SECONDS)
+    delay = _RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1))
+    # El jitter evita que varias fotos enviadas a la vez vuelvan a chocar juntas
+    # contra el mismo límite por minuto. Se acota después de sumarlo: si no, el
+    # tope dejaría de serlo justo en los reintentos más tardíos.
+    return min(delay + random.uniform(0, _RETRY_JITTER_SECONDS), _RETRY_MAX_SECONDS)
+
+
 def _retryable_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(token in text for token in (
@@ -116,7 +154,12 @@ async def durable_worker(bot: "Bot", worker_id: str) -> None:
             if not ingestion:
                 raise RuntimeError("ingesta durable no encontrada")
             chat_id = int(ingestion["telegram_chat_id"])
-            await bot.send_message(chat_id=chat_id, text=f"Procesando {ingestion_id[:8]}…")
+            # Un aviso por documento, no por intento: los reintentos son ruido
+            # para quien mandó la foto y ya recibió el acuse de recibo.
+            if int(job.get("attempts") or 1) <= 1:
+                await bot.send_message(
+                    chat_id=chat_id, text=f"Procesando {ingestion_id[:8]}…"
+                )
             result = await _process_with_lease_heartbeat(
                 ingestion_id=ingestion_id, attempt=int(job.get("attempts") or 1),
                 job_id=job["id"], worker_id=worker_id,
@@ -198,26 +241,40 @@ async def durable_worker(bot: "Bot", worker_id: str) -> None:
             attempts = int(job.get("attempts") or 1)
             max_attempts = int(job.get("max_attempts") or 3)
             retryable = _retryable_error(exc) and attempts < max_attempts
+            retry_fields: dict = {}
+            delay_seconds = 0.0
+            if retryable:
+                delay_seconds = _retry_delay_seconds(exc, attempts)
+                retry_fields["available_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+                ).isoformat()
+                logger.info(
+                    "Reintento %s/%s del job %s programado en %.1fs",
+                    attempts + 1, max_attempts, job["id"], delay_seconds,
+                )
             finalized = await _finalize_owned_job(
                 job["id"], worker_id,
                 estado="pendiente" if retryable else "error",
                 stage="retry_wait" if retryable else "failed",
                 error_code="provider_transient" if retryable else "processing_failed",
                 error_detalle=str(exc)[:1000],
+                **retry_fields,
             )
             if not finalized:
                 logger.warning("No se publicó el fallo: lease perdido para job %s", job["id"])
                 continue
             if ingestion_id:
-                from datetime import datetime, timezone
                 fields = {"status": "queued" if retryable else "failed"}
                 if not retryable:
                     fields["failed_at"] = datetime.now(timezone.utc).isoformat()
                 await db.actualizar_ingestion(ingestion_id, **fields)
+                audit_data = {"attempt": attempts, "error": str(exc)[:500]}
+                if retryable:
+                    audit_data["retry_in_seconds"] = round(delay_seconds, 1)
                 await db.registrar_evento_auditoria(
                     "ingestion.retry_scheduled" if retryable else "ingestion.failed",
                     ingestion_id=ingestion_id, job_id=job["id"],
-                    data={"attempt": attempts, "error": str(exc)[:500]},
+                    data=audit_data,
                 )
             try:
                 failed = await db.obtener_ingestion(ingestion_id) if ingestion_id else None

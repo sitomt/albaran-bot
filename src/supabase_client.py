@@ -497,6 +497,33 @@ async def resolver_revisiones_abiertas(
     return count
 
 
+async def buscar_artefacto_ocr_reutilizable(ingestion_id: str) -> dict | None:
+    """Devuelve el OCR ya pagado de un intento anterior, si lo hay.
+
+    El proveedor cobra por página cada vez que se llama, así que repetir el OCR
+    en un reintento cuesta dinero para obtener exactamente el mismo texto: la
+    foto original es inmutable. Solo se reutiliza un artefacto completo y con
+    texto; uno vacío no ahorra nada y sí impediría detectar un OCR fallido.
+    """
+    client = await get_client()
+    res = await (
+        client.table("extraction_artifacts").select("*")
+        .eq("ingestion_id", ingestion_id)
+        .eq("artifact_type", "ocr_raw")
+        .eq("complete", True)
+        .order("attempt", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = _safe_data(res, many=True)
+    if not rows:
+        return None
+    payload = rows[0].get("payload")
+    if not isinstance(payload, dict) or not str(payload.get("text") or "").strip():
+        return None
+    return rows[0]
+
+
 async def siguiente_intento_extraccion(ingestion_id: str) -> int:
     client = await get_client()
     res = await client.table("extraction_artifacts").select("attempt").eq(
@@ -1041,7 +1068,13 @@ async def metricas_operativas() -> dict[str, Any]:
 # ── Catálogo para entrada manual ─────────────────────────────────────────────
 
 async def listar_todos_proveedores() -> list[dict]:
-    """Devuelve todos los proveedores (id, nombre) ordenados por nombre. Usado por /manual."""
+    """Proveedores ordenados por nombre, con su forma de pago habitual.
+
+    La forma de pago viaja con el listado para que la entrada manual no tenga que
+    volver a preguntarla en cada albarán de un proveedor ya conocido.
+    """
     client = await get_client()
-    res = await client.table("proveedores").select("id, nombre").order("nombre").execute()
+    res = await client.table("proveedores").select(
+        "id, nombre, forma_pago_habitual"
+    ).order("nombre").execute()
     return _safe_data(res, many=True)

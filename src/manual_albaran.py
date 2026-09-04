@@ -246,6 +246,68 @@ async def iniciar(chat_id: int, user_id: int | None = None) -> str:
     )
 
 
+async def _cabecera_ya_leida(flow: dict, ingestion: dict) -> str | None:
+    """Rellena la cabecera con lo que el OCR sí supo leer, y devuelve el resumen.
+
+    El caso que motiva esto: un albarán manuscrito en el que el membrete, el
+    número y la fecha salen impresos y se leen perfectamente, pero las líneas van
+    a mano y no hay quien las entienda. Hasta ahora «Introducir a mano» tiraba
+    también lo bueno y volvía a preguntar el proveedor teniéndolo en pantalla.
+
+    Devuelve None si no hay nada aprovechable, para caer al cuestionario normal.
+    """
+    from .ingestion_service import load_candidate
+
+    # Si el OCR se cayó del todo no hay candidato que reutilizar: se comprueba
+    # antes de ir a la base de datos, que es lo caro.
+    if not (ingestion.get("metadata") or {}).get("candidate_artifact_id"):
+        return None
+    try:
+        candidate, _ = await load_candidate(ingestion["id"])
+    except Exception:
+        return None
+    header = (candidate or {}).get("header") or {}
+    nombre = (header.get("proveedor_nombre") or "").strip()
+    if not nombre:
+        return None
+
+    nif = header.get("proveedor_nif")
+    conocido = next(
+        (p for p in flow["_proveedores"] if p["nombre"].strip().casefold() == nombre.casefold()),
+        None,
+    )
+    if conocido:
+        flow["proveedor_id"] = conocido["id"]
+        flow["proveedor_nombre"] = conocido["nombre"]
+        flow["forma_pago"] = conocido.get("forma_pago_habitual") or None
+    else:
+        # Alta de proveedor nuevo sin preguntar: el NIF ya viene validado por
+        # dígito de control desde la extracción, y la forma de pago se pregunta
+        # igualmente más adelante en el flujo.
+        flow["_nuevo"] = {"nombre": nombre, "nif": nif, "forma_pago": None}
+        flow["proveedor_id"] = None
+        flow["proveedor_nombre"] = nombre
+
+    flow["numero_albaran"] = header.get("numero_albaran") or None
+    flow["fecha"] = header.get("fecha") or None
+
+    tengo = [f"Proveedor: {flow['proveedor_nombre']}"]
+    if not conocido:
+        tengo[0] += " (nuevo)"
+    if flow["numero_albaran"]:
+        tengo.append(f"Nº albarán: {flow['numero_albaran']}")
+    tengo.append(f"Fecha: {flow['fecha']}" if flow["fecha"] else "Fecha: falta")
+
+    resumen = "Esto ya lo tengo leído de la foto:\n" + "\n".join(f"• {t}" for t in tengo)
+    resumen += "\n\n(si algo no cuadra, escribe CABECERA y lo cambiamos)\n\n"
+
+    if not flow["fecha"]:
+        flow["step"] = "fecha"
+        return resumen + "¿Qué fecha pone el albarán? (04-05-2026, o «hoy»)"
+    flow["step"] = "productos"
+    return resumen + _pedir_productos()
+
+
 async def iniciar_desde_ingestion(chat_id: int, user_id: int, ingestion_id: str) -> str:
     """Reutiliza el original durable de un OCR fallido sin volver a subirlo."""
     ingestion = await db.obtener_ingestion(ingestion_id)
@@ -260,6 +322,9 @@ async def iniciar_desde_ingestion(chat_id: int, user_id: int, ingestion_id: str)
     flow["_existing_evidence"] = bool(
         ingestion.get("storage_bucket") and ingestion.get("storage_path")
     )
+    aprovechado = await _cabecera_ya_leida(flow, ingestion)
+    if aprovechado:
+        text = aprovechado
     if flow["_existing_evidence"]:
         text = "📎 Usaré la foto que ya está guardada como archivo del albarán.\n\n" + text
     return text
@@ -315,6 +380,7 @@ async def _step_proveedor(flow: dict, texto: str) -> str:
             p = proveedores[idx - 1]
             flow["proveedor_id"] = p["id"]
             flow["proveedor_nombre"] = p["nombre"]
+            flow["forma_pago"] = p.get("forma_pago_habitual") or None
             flow["step"] = "cabecera"
             return _pedir_cabecera(p["nombre"])
         return f"No hay proveedor con el número {idx}. Elige uno de la lista o escribe un nombre nuevo."
@@ -324,6 +390,7 @@ async def _step_proveedor(flow: dict, texto: str) -> str:
     if existente:
         flow["proveedor_id"] = existente["id"]
         flow["proveedor_nombre"] = existente["nombre"]
+        flow["forma_pago"] = existente.get("forma_pago_habitual") or None
         flow["step"] = "cabecera"
         return _pedir_cabecera(existente["nombre"])
 
@@ -382,6 +449,10 @@ def _step_cabecera(flow: dict, texto: str) -> str:
 
 
 def _step_fecha(flow: dict, texto: str) -> str:
+    if texto.strip().casefold() in {"hoy", "es de hoy"}:
+        flow["fecha"] = datetime.now().date().isoformat()
+        flow["step"] = "productos"
+        return _pedir_productos()
     fecha = _parsear_fecha(texto)
     if not fecha:
         return "Sigo sin entender la fecha. Prueba con 04-05-2026 o «4 de mayo de 2026»."
@@ -394,51 +465,151 @@ def _step_fecha(flow: dict, texto: str) -> str:
 
 def _pedir_productos() -> str:
     return (
-        "Ahora añade los productos uno a uno.\n"
-        "Formato: nombre, cantidad, precio neto\n"
-        "Ejemplo: Tomate entero, 12, 1.81\n\n"
-        "Si el papel muestra todas las columnas, también puedes escribir:\n"
-        "nombre | cantidad | tarifa | descuento | neto | importe\n"
-        "Ejemplo: Tomate | 10 | 2,00 | 10 | 1,80 | 18,00\n\n"
-        "Escribe FIN cuando termines o /corregir para borrar el último producto."
+        "Ahora los productos. Mándalos todos en un mismo mensaje, uno por línea, "
+        "con nombre, cantidad y precio:\n\n"
+        "Pollos 15,4 2,75\n"
+        "Pechugas 3,2 5,70\n"
+        "FIN\n\n"
+        "Si no puedes leer los productos: SIN DETALLE 133,67 (el total del albarán).\n"
+        "Más opciones: /corregir borra el último · CABECERA vuelve atrás · "
+        "nombre | cantidad | tarifa | descuento | neto | importe si el papel trae todas las columnas."
+    )
+
+
+# Escapatoria para el albarán realmente ilegible. Guardar solo proveedor, fecha y
+# total conserva el control de gasto, que es para lo que sirve el 90% de estos
+# documentos; el detalle por producto se pierde, pero la alternativa real no es
+# tener el detalle: es que la persona se harte y no registre el albarán.
+_SIN_DETALLE = re.compile(
+    r"^(?:sin\s*detalle|solo\s*(?:el\s*)?total)\s*[:=]?\s*(?P<total>.*)$", re.IGNORECASE
+)
+LINEA_SIN_DETALLAR = "Productos sin detallar"
+
+
+def _step_sin_detalle(flow: dict, importe: float) -> str:
+    flow["lineas"] = [{
+        "nombre": LINEA_SIN_DETALLAR, "cantidad": 1.0, "precio": importe,
+        "importe": importe, "entrada_detallada": False, "sin_detallar": True,
+    }]
+    flow["step"] = "total"
+    return (
+        f"Guardado como una sola línea de {_fmt_importe(importe)} «{LINEA_SIN_DETALLAR}».\n"
+        "Este albarán contará para el gasto por proveedor y por fecha, pero no para "
+        "las consultas por producto.\n\n"
+        "¿Lleva IVA?\n"
+        "• OK — ese importe es el total y no hay IVA.\n"
+        "• IVA 13,37 — se añade a lo anterior.\n"
+        "• 147,04 — total final; la diferencia se tratará como IVA."
+    )
+
+
+def _leer_lineas_de_productos(texto: str) -> tuple[list[dict], list[str]]:
+    """Interpreta un mensaje con VARIOS productos, uno por línea.
+
+    Teclear un producto por mensaje son tantos viajes de ida y vuelta como
+    productos tenga el albarán. Aceptando el bloque entero, un albarán de diez
+    líneas pasa de diez mensajes a uno, y quien lo escribe puede copiarlo o
+    dictarlo del tirón mirando el papel una sola vez.
+
+    Devuelve (líneas entendidas, textos no entendidos) para poder preguntar solo
+    por lo que ha fallado en vez de rechazar el mensaje entero.
+    """
+    reconocidas: list[dict] = []
+    rechazadas: list[str] = []
+    for cruda in texto.splitlines():
+        renglon = cruda.strip()
+        if not renglon or renglon.casefold() in {"fin", "ok"}:
+            continue
+        detallada = _parsear_producto_detallado(renglon) if "|" in renglon else None
+        simple = _parsear_producto(renglon) if detallada is None and "|" not in renglon else None
+        if detallada is not None:
+            reconocidas.append(detallada)
+        elif simple is not None:
+            nombre, cantidad, precio = simple
+            reconocidas.append({
+                "nombre": nombre, "cantidad": cantidad, "precio": precio,
+                "importe": round(cantidad * precio, 2), "entrada_detallada": False,
+            })
+        else:
+            rechazadas.append(renglon)
+    return reconocidas, rechazadas
+
+
+def _pedir_totales(flow: dict) -> str:
+    total = _total_lineas(flow)
+    return (
+        f"Base calculada de las líneas: {_fmt_importe(total)}\n\n"
+        "Escribe una de estas opciones:\n"
+        "• OK — no hay IVA y el total coincide.\n"
+        "• IVA 3,78 — añade ese IVA a la base.\n"
+        "• 98,43 — total final; la diferencia se tratará como IVA.\n"
+        "• 94,65 / 3,78 / 98,43 — BASE / IVA / TOTAL.\n\n"
+        "Si falta un porte, envase u otro cargo, escribe ATRÁS y añádelo como producto."
     )
 
 
 def _step_productos(flow: dict, texto: str) -> str:
-    if texto.lower() == "fin":
+    plano = texto.strip()
+    if plano.casefold() in {"cabecera", "atrás", "atras"}:
+        # Se ha colado un dato de la cabecera que venía del OCR: se puede volver
+        # sin perder los productos ya escritos.
+        flow["step"] = "cabecera"
+        return _pedir_cabecera(flow["proveedor_nombre"] or "el proveedor")
+
+    sin_detalle = _SIN_DETALLE.match(plano)
+    if sin_detalle:
+        importe = _num(sin_detalle.group("total"))
+        if importe is None or importe <= 0:
+            return "Necesito el importe total del albarán. Por ejemplo: SIN DETALLE 133,67"
+        return _step_sin_detalle(flow, importe)
+
+    termina = any(
+        renglon.strip().casefold() == "fin" for renglon in texto.splitlines()
+    )
+    reconocidas, rechazadas = _leer_lineas_de_productos(texto)
+    flow["lineas"].extend(reconocidas)
+
+    if not reconocidas and not termina:
+        return (
+            "No he entendido ninguna línea. Cada producto va en su renglón, así:\n"
+            "Tomate entero 12 1,81\n"
+            "o con todas las columnas: nombre | cantidad | tarifa | descuento | neto | importe"
+        )
+
+    # Lo entendido se queda; solo se vuelve a preguntar por lo que falló. Rechazar
+    # el mensaje entero por un renglón obligaría a reescribir los buenos.
+    aviso = ""
+    if rechazadas:
+        listado = "\n".join(f"   {renglon}" for renglon in rechazadas[:5])
+        aviso = (
+            f"\n\n⚠️ Esto no lo he entendido y NO se ha guardado:\n{listado}\n"
+            "Vuelve a escribirlo como: nombre cantidad precio"
+        )
+
+    if termina and not rechazadas:
         if not flow["lineas"]:
             return "No has añadido ningún producto todavía. Añade al menos uno o escribe /cancelar."
         flow["step"] = "total"
-        total = _total_lineas(flow)
-        return (
-            f"Base calculada de las líneas: {_fmt_importe(total)}\n\n"
-            "Escribe una de estas opciones:\n"
-            "• OK — no hay IVA y el total coincide.\n"
-            "• IVA 3,78 — añade ese IVA a la base.\n"
-            "• 98,43 — total final; la diferencia se tratará como IVA.\n"
-            "• 94,65 / 3,78 / 98,43 — BASE / IVA / TOTAL.\n\n"
-            "Si falta un porte, envase u otro cargo, escribe ATRÁS y añádelo como producto."
-        )
+        return _resumen_de_lineas(flow, reconocidas) + "\n\n" + _pedir_totales(flow)
 
-    detailed = _parsear_producto_detallado(texto) if "|" in texto else None
-    parsed = _parsear_producto(texto) if detailed is None and "|" not in texto else None
-    if detailed is None and parsed is None:
-        return (
-            "No he entendido o las cifras no cuadran. Usa:\n"
-            "nombre, cantidad, precio neto\n"
-            "o nombre | cantidad | tarifa | descuento | neto | importe"
-        )
-    if detailed is not None:
-        line = detailed
-        nombre, cantidad, precio = line["nombre"], line["cantidad"], line["precio"]
-    else:
-        nombre, cantidad, precio = parsed
-        line = {
-            "nombre": nombre, "cantidad": cantidad, "precio": precio,
-            "importe": round(cantidad * precio, 2), "entrada_detallada": False,
-        }
-    flow["lineas"].append(line)
-    return f"✓ {nombre} × {_cant(cantidad)} a {_fmt_importe(precio)}\n\nAñade otro, o FIN para terminar."
+    return (
+        _resumen_de_lineas(flow, reconocidas) + aviso
+        + "\n\nAñade más, o FIN para terminar."
+    )
+
+
+def _resumen_de_lineas(flow: dict, nuevas: list[dict]) -> str:
+    """Confirma lo aceptado con su importe, para poder cotejarlo con el papel."""
+    if not nuevas:
+        return "No he añadido ninguna línea nueva."
+    detalle = "\n".join(
+        f"✓ {l['nombre']} × {_cant(l['cantidad'])} a {_fmt_importe(l['precio'])}"
+        f" = {_fmt_importe(l['importe'])}"
+        for l in nuevas
+    )
+    if len(flow["lineas"]) == len(nuevas):
+        return detalle
+    return f"{detalle}\n\nLlevas {len(flow['lineas'])} productos, {_fmt_importe(_total_lineas(flow))}."
 
 
 def corregir_ultimo(chat_id: int) -> str:
@@ -479,9 +650,29 @@ def _step_total(flow: dict, texto: str) -> str:
     flow["base_manual"] = base
     flow["iva_manual"] = iva
     flow["total_manual"] = total
+    cuadre = f"Cuadre: {_fmt_importe(base)} + IVA {_fmt_importe(iva)} = {_fmt_importe(total)}.\n\n"
+    return cuadre + _pedir_forma_pago(flow)
+
+
+def _pedir_forma_pago(flow: dict) -> str:
+    """Si ya sabemos cómo paga ese proveedor, se da por buena y no se pregunta.
+
+    Es un dato que casi nunca cambia de un albarán al siguiente, y sigue estando
+    a la vista en el resumen final por si hay que corregirlo.
+    """
+    if flow.get("forma_pago"):
+        flow["step"] = "foto" if not (
+            flow.get("_imagen_bytes") or flow.get("_existing_evidence")
+        ) else "confirmacion"
+        cabecera = f"Forma de pago: {flow['forma_pago']} (la habitual de este proveedor).\n\n"
+        if flow["step"] == "confirmacion":
+            return cabecera + _resumen(flow)
+        return cabecera + (
+            "¿Quieres añadir una foto del albarán para archivo?\n"
+            "Mándala ahora o escribe NO."
+        )
     flow["step"] = "forma_pago"
     return (
-        f"Cuadre: {_fmt_importe(base)} + IVA {_fmt_importe(iva)} = {_fmt_importe(total)}.\n\n"
         "¿Forma de pago? (ej: 15 días, 30 días, contado)\nO escribe NO si no aplica."
     )
 
@@ -544,7 +735,7 @@ def _resumen(flow: dict) -> str:
     lineas = [
         "Resumen del albarán:",
         " | ".join(cabecera),
-        f"{len(flow['lineas'])} productos",
+        f"{len(flow['lineas'])} producto" + ("s" if len(flow["lineas"]) != 1 else ""),
         f"Base: {_fmt_importe(base)} + IVA: {_fmt_importe(iva)} = Total: {_fmt_importe(total)}",
         "",
         "Líneas:",
@@ -600,7 +791,9 @@ async def _step_confirmacion(chat_id: int, flow: dict, texto: str) -> str:
     total = resultado["total"]
     return (
         f"✓ Albarán manual guardado — {flow['proveedor_nombre']}\n"
-        f"{len(flow['lineas'])} productos | Total: {_fmt_importe(total)}\n"
+        f"{len(flow['lineas'])} producto"
+        + ("s" if len(flow["lineas"]) != 1 else "")
+        + f" | Total: {_fmt_importe(total)}\n"
         "Registrado como entrada manual."
     )
 

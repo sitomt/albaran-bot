@@ -200,6 +200,21 @@ async def _ocr(image_bytes: bytes, client: Mistral, content_type: str = "image/j
     )
 
 
+def _ocr_desde_artefacto(artifact: dict[str, Any]) -> OCRResult:
+    """Reconstruye el resultado de OCR guardado sin volver a llamar al proveedor."""
+    payload = artifact.get("payload") or {}
+    confidence = payload.get("confidence")
+    return OCRResult(
+        text=str(payload.get("text") or ""),
+        raw=payload.get("response") if isinstance(payload.get("response"), dict) else {},
+        confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
+        # Sin llamada no hay tokens ni páginas que facturar: dejar el uso vacío es
+        # lo que impide que el ledger registre un coste que nadie ha pagado.
+        usage=Usage(),
+        duration_ms=0,
+    )
+
+
 async def _classify(
     image_bytes: bytes, client: Mistral, content_type: str = "image/jpeg"
 ) -> Classification:
@@ -805,8 +820,18 @@ async def process_ingestion(ingestion_id: str, *, attempt: int = 1) -> Candidate
     client = Mistral(api_key=settings.MISTRAL_API_KEY)
     content_type = str(ingestion.get("content_type") or "image/jpeg")
     classification_task = asyncio.create_task(_classify(image_bytes, client, content_type))
+    # La foto original no cambia entre intentos, así que su OCR tampoco: repetir
+    # la llamada en un reintento paga otra vez por el mismo texto.
+    reused_ocr = await db.buscar_artefacto_ocr_reutilizable(ingestion_id)
     try:
-        ocr = await _ocr(image_bytes, client, content_type)
+        if reused_ocr is not None:
+            ocr = _ocr_desde_artefacto(reused_ocr)
+            logger.info(
+                "OCR reutilizado del intento %s para la ingesta %s",
+                reused_ocr.get("attempt"), ingestion_id,
+            )
+        else:
+            ocr = await _ocr(image_bytes, client, content_type)
     except Exception:
         if classification_task.done() and not classification_task.cancelled():
             completed = await asyncio.gather(classification_task, return_exceptions=True)
@@ -827,7 +852,7 @@ async def process_ingestion(ingestion_id: str, *, attempt: int = 1) -> Candidate
             await asyncio.gather(classification_task, return_exceptions=True)
         raise
     classification = await classification_task
-    ocr_cost = await _record_usage_safely(
+    ocr_cost = 0.0 if reused_ocr is not None else await _record_usage_safely(
         ingestion_id=ingestion_id, user_id=user_id, operation="ocr",
         model=_MODELO_OCR, usage=ocr.usage, duration_ms=ocr.duration_ms,
         metadata={"attempt": attempt}, retries=int(attempt > 1),
@@ -847,12 +872,13 @@ async def process_ingestion(ingestion_id: str, *, attempt: int = 1) -> Candidate
             "El documento no es un albarán de proveedor", reason=rejection_reason
         )
 
-    await db.registrar_artefacto_extraccion(
-        ingestion_id=ingestion_id, attempt=attempt, artifact_type="ocr_raw",
-        payload={"text": ocr.text, "response": ocr.raw, "confidence": ocr.confidence},
-        model_name=_MODELO_OCR, model_version=_MODELO_OCR, pages=ocr.usage.pages,
-        duration_ms=ocr.duration_ms, cost_usd=ocr_cost, complete=True,
-    )
+    if reused_ocr is None:
+        await db.registrar_artefacto_extraccion(
+            ingestion_id=ingestion_id, attempt=attempt, artifact_type="ocr_raw",
+            payload={"text": ocr.text, "response": ocr.raw, "confidence": ocr.confidence},
+            model_name=_MODELO_OCR, model_version=_MODELO_OCR, pages=ocr.usage.pages,
+            duration_ms=ocr.duration_ms, cost_usd=ocr_cost, complete=True,
+        )
     try:
         raw, extraction_usage, extraction_ms = await _extract(ocr.text, client)
     except BillableExtractionError as exc:

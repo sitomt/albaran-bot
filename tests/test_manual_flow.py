@@ -33,7 +33,11 @@ class FakeDB:
         self.audit_events = []
 
     async def listar_todos_proveedores(self):
-        return [{"id": p["id"], "nombre": p["nombre"]} for p in self.proveedores]
+        return [
+            {"id": p["id"], "nombre": p["nombre"],
+             "forma_pago_habitual": p.get("forma_pago_habitual")}
+            for p in self.proveedores
+        ]
 
     async def buscar_albaran_duplicado_por_nombre_proveedor(self, nombre, fecha, total):
         return next((a for a in self.albaranes

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -257,3 +258,98 @@ async def test_rechazo_terminal_preserva_rejected_y_no_se_convierte_en_failed(mo
     assert all(call.kwargs.get("status") != "failed" for call in update_ingestion.await_args_list)
     audit.assert_awaited_once()
     assert "Documento rechazado" in telegram.send_message.await_args_list[-1].kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_fallo_transitorio_programa_espera_antes_de_reintentar(monkeypatch):
+    """Un 429 reintentado en el mismo segundo solo garantiza otro 429."""
+    job = _job()
+    _stop_after_one_job(monkeypatch, job)
+    ingestion = {"id": job["ingestion_id"], "telegram_chat_id": 123}
+    monkeypatch.setattr(queue_manager.db, "obtener_ingestion", AsyncMock(return_value=ingestion))
+    finalize_job = AsyncMock(return_value=True)
+    audit = AsyncMock()
+    monkeypatch.setattr(queue_manager.db, "finalizar_job_con_lease", finalize_job)
+    monkeypatch.setattr(queue_manager.db, "actualizar_ingestion", AsyncMock())
+    monkeypatch.setattr(queue_manager.db, "registrar_evento_auditoria", audit)
+    monkeypatch.setattr(
+        queue_manager, "process_ingestion",
+        AsyncMock(side_effect=RuntimeError("Status 429. Rate limit exceeded")),
+    )
+    telegram = SimpleNamespace(send_message=AsyncMock())
+
+    with pytest.raises(asyncio.CancelledError):
+        await queue_manager.durable_worker(telegram, "worker-test")
+
+    kwargs = finalize_job.await_args.kwargs
+    assert kwargs["estado"] == "pendiente"
+    assert kwargs["stage"] == "retry_wait"
+    scheduled = datetime.fromisoformat(kwargs["available_at"])
+    assert scheduled > datetime.now(timezone.utc) + timedelta(seconds=15)
+    assert audit.await_args.kwargs["data"]["retry_in_seconds"] >= 20
+
+
+@pytest.mark.asyncio
+async def test_fallo_definitivo_no_programa_espera(monkeypatch):
+    job = _job()
+    _stop_after_one_job(monkeypatch, job)
+    monkeypatch.setattr(
+        queue_manager.db, "obtener_ingestion",
+        AsyncMock(return_value={"id": job["ingestion_id"], "telegram_chat_id": 123}),
+    )
+    finalize_job = AsyncMock(return_value=True)
+    monkeypatch.setattr(queue_manager.db, "finalizar_job_con_lease", finalize_job)
+    monkeypatch.setattr(queue_manager.db, "actualizar_ingestion", AsyncMock())
+    monkeypatch.setattr(queue_manager.db, "registrar_evento_auditoria", AsyncMock())
+    monkeypatch.setattr(
+        queue_manager, "process_ingestion", AsyncMock(side_effect=ValueError("OCR inválido")),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await queue_manager.durable_worker(SimpleNamespace(send_message=AsyncMock()), "worker-test")
+
+    assert "available_at" not in finalize_job.await_args.kwargs
+
+
+def test_backoff_crece_con_los_intentos_y_esta_acotado():
+    error = RuntimeError("Status 429")
+    primero = queue_manager._retry_delay_seconds(error, 1)
+    segundo = queue_manager._retry_delay_seconds(error, 2)
+    assert 20 <= primero <= 25
+    assert 40 <= segundo <= 45
+    assert queue_manager._retry_delay_seconds(error, 99) <= queue_manager._RETRY_MAX_SECONDS
+
+
+def test_backoff_respeta_el_retry_after_del_proveedor():
+    assert queue_manager._retry_delay_seconds(
+        RuntimeError('{"error":"rate_limited","retry-after": 42}'), 1
+    ) == 42
+    assert queue_manager._retry_delay_seconds(
+        RuntimeError("Rate limit exceeded, try again in 7s"), 3
+    ) == 7
+
+
+@pytest.mark.asyncio
+async def test_reintento_no_repite_el_aviso_de_procesando(monkeypatch):
+    """El acuse de recibo es por documento; un intento no es noticia para nadie."""
+    job = {**_job(), "attempts": 2}
+    _stop_after_one_job(monkeypatch, job)
+    monkeypatch.setattr(
+        queue_manager.db, "obtener_ingestion",
+        AsyncMock(return_value={"id": job["ingestion_id"], "telegram_chat_id": 123}),
+    )
+    monkeypatch.setattr(queue_manager.db, "finalizar_job_con_lease", AsyncMock(return_value=True))
+    monkeypatch.setattr(queue_manager.db, "actualizar_ingestion", AsyncMock())
+    monkeypatch.setattr(
+        queue_manager, "process_ingestion",
+        AsyncMock(return_value=_candidate(open_review_count=1)),
+    )
+    monkeypatch.setattr(queue_manager, "format_candidate_summary", lambda _r: "Revisión requerida")
+    telegram = SimpleNamespace(send_message=AsyncMock())
+
+    with pytest.raises(asyncio.CancelledError):
+        await queue_manager.durable_worker(telegram, "worker-test")
+
+    enviados = [call.kwargs["text"] for call in telegram.send_message.await_args_list]
+    assert not any(texto.startswith("Procesando") for texto in enviados)
+    assert enviados == ["Revisión requerida"]
