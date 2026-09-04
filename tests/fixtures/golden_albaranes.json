@@ -36,11 +36,11 @@
     },
     {
       "file": "7b5820df-b53c-44f3-814e-13e3cd41a892.JPG",
-      "sha256": "15ae2d2110ef640796148f43d38a83c3f5913ba6a12c33958bc84d1925180a05",
+      "sha256": "dd6446d1286b97697579ce5fd0b88bd854f15f1060ce5a8b1dfc91e159f0ca5d",
       "document_kind": "printed_invoice",
       "expected_outcome": "confirmable",
       "handwritten": false,
-      "header": {"supplier": "Fragma", "number": "C-04532", "accepted_numbers": ["C-04532", "A-02782/26"], "date": "2026-05-26", "base": 109.8, "vat": 23.06, "total": 132.86},
+      "header": {"supplier": "Fragma", "number": "C-044532", "accepted_numbers": ["C-044532", "A-02782/26"], "date": "2026-05-26", "base": 109.8, "vat": 23.06, "total": 132.86},
       "lines": [{"quantity": 12.0, "tariff_price": 9.6, "discount_per_unit": 0.45, "unit_price": 9.15, "amount": 109.8}],
       "vat_breakdown": [{"rate": 21.0, "base": 109.8, "quota": 23.06}]
     },
@@ -116,12 +116,21 @@
     },
     {
       "file": "33b5e803-575f-4f28-bb79-f0a346759244.JPG",
-      "sha256": "54d0240445a099674e4d5b50f35cb6c93fd56f7fe437052bf3a77a7281e73482",
+      "sha256": "24a4c7a736b4ad978d845084eddd83e68cc1191a9f32b221cc909fd922ee388c",
       "document_kind": "long_retail_ticket",
       "expected_outcome": "review",
       "handwritten": false,
       "header": {"supplier": "Makro", "date": "2026-05-30", "total": 353.78},
-      "reason": "Ticket largo, rotado y con múltiples descuentos; se exige OCR completo y reconciliación antes de confirmar."
+      "reason": "Ticket largo con múltiples descuentos; se exige OCR completo y reconciliación antes de confirmar."
+    },
+    {
+      "file": "makro-ticket-rotado.JPG",
+      "sha256": "86a8807b84c2b24062f209655fe7cc1464b143884286dfe9a824a713fcdf6f6b",
+      "document_kind": "long_retail_ticket",
+      "expected_outcome": "review",
+      "handwritten": false,
+      "header": {"supplier": "Makro", "date": "2026-05-30", "total": 353.78},
+      "reason": "El mismo ticket girado 11 grados: nadie fotografía un albarán perfectamente alineado. Verifica que el giro no degrada el OCR ni las cifras. Giro aplicado por software, así que no reproduce la perspectiva ni las sombras de una foto realmente torcida."
     }
   ]
 }

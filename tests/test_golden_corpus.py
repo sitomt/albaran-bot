@@ -21,7 +21,7 @@ def _documents():
 
 def test_corpus_real_tiene_hashes_estables_y_sin_duplicados():
     documents = _documents()
-    assert len(documents) == 11
+    assert len(documents) == 12
     if not IMAGES.is_dir():
         pytest.skip("las fotos reales son privadas y no se versionan en CI")
     hashes = []
